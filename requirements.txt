@@ -1,5 +1,4 @@
 aiogram==3.7.0
-aiohttp==3.9.5
 Pillow
-numpy
-requests
+numpy==1.26.4
+scikit-learn==1.3.2
