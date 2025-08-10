@@ -1,188 +1,183 @@
-# bot.py
 import os
 import io
 import asyncio
+import logging
+import tempfile
 from typing import List, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from sklearn.cluster import KMeans
 
-from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
+from aiogram.client.default import DefaultBotProperties
+from aiogram.types import FSInputFile
 
-# ====== НАСТРОЙКИ КАНАЛА (как просили — вписаны явно) ======
-CHANNEL_USERNAME = "assistantdesign"        # t.me/assistantdesign
-CHANNEL_ID = -10020628787147                # числовой id канала
+# ─── SETTINGS ──────────────────────────────────────────────────────────────────
+# Токен берём ТОЛЬКО из переменных окружения на Render
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN".lower())
 
-# ====== ЗАГРУЗКА ТОКЕНА И СОЗДАНИЕ БОТА ======
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Env var TELEGRAM_BOT_TOKEN is missing")
+# Канал: я подставил твои данные, их можно переопределить переменными окружения.
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "assistantdesign")          # без @
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-10026082781747"))                 # именно отрицательное
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)  # aiogram 3.7+
-)
+# Требовать подписку в ЛС? (True/False)
+REQUIRE_SUB = False
 
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
+# Количество цветов в палитре
+PALETTE_SIZE = 5
 
-# ====== УТИЛИТЫ ДЛЯ ПАЛИТРЫ ======
+# ─── LOGGING ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("palette-bot")
 
-def _to_hex(rgb: Tuple[int, int, int]) -> str:
-    return "#{:02x}{:02x}{:02x}".format(*rgb).lower()
+# ─── COLOR UTILS ───────────────────────────────────────────────────────────────
+def extract_palette(img: Image.Image, k: int = PALETTE_SIZE) -> List[Tuple[int,int,int]]:
+    # уменьшим для скорости
+    img_small = img.copy()
+    img_small.thumbnail((400, 400))
+    arr = np.asarray(img_small.convert("RGB")).reshape(-1, 3).astype(np.float32)
 
-def extract_palette(img: Image.Image, k: int = 5) -> List[Tuple[int, int, int]]:
-    """
-    Берём k доминирующих цветов через KMeans (scikit-learn),
-    предварительно уменьшаем изображение для скорости.
-    """
-    # лёгкая нормализация
-    img = img.convert("RGB")
-    img_small = img.resize((300, 300))
-    arr = np.array(img_small).reshape(-1, 3).astype(np.float32)
-
-    # KMeans (склейка оттенков)
-    # Склеим кластеры детерминированно для повторяемости
-    from sklearn.cluster import KMeans
+    # KMeans
     km = KMeans(n_clusters=k, n_init=10, random_state=42)
     labels = km.fit_predict(arr)
-    centers = km.cluster_centers_.astype(np.uint8)
+    centers = km.cluster_centers_.astype(int)
 
-    # Отсортируем по размеру кластера (частоте вхождений)
-    counts = np.bincount(labels)
-    order = np.argsort(counts)[::-1]
-
+    # сортировка по частоте кластера
+    counts = np.bincount(labels, minlength=k)
+    order = np.argsort(-counts)
     palette = [tuple(map(int, centers[i])) for i in order]
     return palette
 
-def draw_palette_card(palette: List[Tuple[int, int, int]]) -> Image.Image:
-    """
-    Рисуем карточку 1000x560: сверху полосы цветов, снизу подписи HEX.
-    """
-    width, height = 1000, 560
-    pad = 30
-    swatch_h = 320
-    gap = 12
+def rgb_to_hex(rgb: Tuple[int,int,int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
 
-    card = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(card)
+def draw_palette(palette: List[Tuple[int,int,int]]) -> Image.Image:
+    sw = 180   # ширина свача
+    sh = 120   # высота свача
+    pad = 20   # поля
+    text_h = 26
 
-    n = len(palette)
-    swatch_w = (width - pad*2 - gap*(n-1)) // n
+    width = pad*2 + sw*len(palette)
+    height = pad*2 + sh + text_h
 
-    # Полосы цветов
-    x = pad
-    for rgb in palette:
-        draw.rectangle([x, pad, x + swatch_w, pad + swatch_h], fill=rgb)
-        x += swatch_w + gap
-
-    # Подписи HEX под каждой полосой
-    # Подберём простой системный шрифт (на сервере не гарантированы TTF)
+    img = Image.new("RGB", (width, height), (250, 250, 250))
+    draw = ImageDraw.Draw(img)
     try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 32)
-    except:
+        font = ImageFont.truetype("DejaVuSans.ttf", 16)
+    except Exception:
         font = ImageFont.load_default()
 
-    x = pad
-    y_text = pad + swatch_h + 40
+    for i, rgb in enumerate(palette):
+        x = pad + i*sw
+        y = pad
+        draw.rectangle([x, y, x+sw-1, y+sh-1], fill=rgb)
+        hex_code = rgb_to_hex(rgb)
+        w, h = draw.textsize(hex_code, font=font)
+        draw.text((x + (sw-w)//2, y + sh + 4), hex_code, fill=(10,10,10), font=font)
 
-    for rgb in palette:
-        hex_code = _to_hex(rgb)
-        # рамка под текст, чтобы читалось
-        text_w, text_h = draw.textbbox((0, 0), hex_code, font=font)[2:]
-        cx = x + swatch_w // 2
-        tx = cx - text_w // 2
-        draw.text((tx, y_text), hex_code, fill=(30, 30, 30), font=font)
-        x += swatch_w + gap
+    return img
 
-    return card
+# ─── BOT ───────────────────────────────────────────────────────────────────────
+dp = Dispatcher()
 
-# ====== ХЕНДЛЕРЫ ======
-
-@router.message(CommandStart())
-async def cmd_start(msg: types.Message):
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, bot: Bot):
     text = (
         "Привет! Я анализирую изображения и вытаскиваю доминирующие цвета.\n\n"
-        f"Добавьте меня админом в канал <b>@{CHANNEL_USERNAME}</b>, "
-        "публикуйте фото — я пришлю палитру в ответ к посту."
+        f"Добавь меня *админом* в канал @{CHANNEL_USERNAME}, опубликуй фото — "
+        "я пришлю палитру в ответ к посту.\n\n"
+        "Также можно прислать фото в этот чат."
     )
-    await msg.answer(text)
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
-@router.message(F.chat.type == "channel", F.photo)
-async def on_channel_photo(msg: types.Message):
-    # Обрабатываем ТОЛЬКО наш канал
-    if msg.chat.id != CHANNEL_ID:
-        return
+async def _download_largest_photo(bot: Bot, message: types.Message) -> str:
+    """Скачиваем самое большое превью фото в temp-файл, возвращаем путь."""
+    ph = message.photo[-1]  # самое большое превью
+    file = await bot.get_file(ph.file_id)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    await bot.download(file, destination=tmp.name)
+    return tmp.name
 
+async def _process_and_send_palette(bot: Bot, target_chat_id: int, reply_to: int, image_path: str):
+    """Строим палитру и отправляем в target_chat_id, отвечая на сообщение reply_to."""
     try:
-        # Берём самое большое превью
-        file_id = msg.photo[-1].file_id
-
-        # Скачиваем в память
-        buf = io.BytesIO()
-        await bot.download(file_id, destination=buf)
-        buf.seek(0)
-
-        # Анализ цвета
-        img = Image.open(buf)
-        palette = extract_palette(img, k=5)
-        card = draw_palette_card(palette)
-
-        # Готовим буфер с картинкой‑карточкой
-        out = io.BytesIO()
-        card.save(out, format="PNG")
-        out.seek(0)
-
-        # Текст подписи
-        hex_list = " • ".join(_to_hex(rgb) for rgb in palette)
-        caption = f"Палитра: {hex_list}"
-
-        # Отправляем в ответ на пост
-        await bot.send_photo(
-            chat_id=msg.chat.id,
-            photo=out,
-            caption=caption,
-            reply_to_message_id=msg.message_id
-        )
-
+        with Image.open(image_path) as im:
+            palette = extract_palette(im, PALETTE_SIZE)
     except Exception as e:
-        # Лог в канал (в ответ) — чтобы видеть причину, если что-то пойдёт не так
-        await bot.send_message(
-            chat_id=msg.chat.id,
-            text=f"⚠️ Ошибка при обработке изображения: <code>{e}</code>",
-            reply_to_message_id=msg.message_id
-        )
+        log.exception("Ошибка извлечения палитры: %s", e)
+        await bot.send_message(target_chat_id, "Не удалось обработать изображение 😔", reply_to_message_id=reply_to)
+        return
+    finally:
+        # удаляем временный файл
+        try:
+            os.unlink(image_path)
+        except Exception:
+            pass
 
-# (Необязательно) можно слушать личку, если кто-то пришлёт фото боту напрямую
-@router.message(F.chat.type.in_({"private"}), F.photo)
-async def on_private_photo(msg: types.Message):
-    file_id = msg.photo[-1].file_id
+    # рендер картинки палитры
+    pal_img = draw_palette(palette)
     buf = io.BytesIO()
-    await bot.download(file_id, destination=buf)
+    pal_img.save(buf, format="PNG")
     buf.seek(0)
 
-    img = Image.open(buf)
-    palette = extract_palette(img, k=5)
-    card = draw_palette_card(palette)
+    # подпись с HEX
+    hex_lines = [rgb_to_hex(c) for c in palette]
+    caption = "Палитра:\n" + " ".join(hex_lines)
 
-    out = io.BytesIO()
-    card.save(out, format="PNG")
-    out.seek(0)
-
-    hex_list = "\n".join(_to_hex(rgb) for rgb in palette)
-    await msg.answer_photo(out, caption=f"Палитра:\n{hex_list}")
-
-# ====== ЗАПУСК ПОЛЛИНГА ======
-
-async def main():
-    await dp.start_polling(
-        bot,
-        allowed_updates=dp.resolve_used_update_types()
+    # отправка
+    await bot.send_photo(
+        chat_id=target_chat_id,
+        photo=buf,
+        caption=caption,
+        reply_to_message_id=reply_to
     )
+
+# ── ЛС: пользователь прислал фото ─────────────────────────────────────────────
+@dp.message(F.photo & F.chat.type == "private")
+async def on_private_photo(message: types.Message, bot: Bot):
+    log.info("ЛС: пришло фото от %s", message.from_user.id)
+
+    # по желанию можно требовать подписку на канал
+    if REQUIRE_SUB:
+        try:
+            member = await bot.get_chat_member(CHANNEL_ID, message.from_user.id)
+            if member.status not in ("member", "administrator", "creator"):
+                await message.answer(f"Для использования подпишись на @{CHANNEL_USERNAME} 🙂")
+                return
+        except Exception:
+            await message.answer(f"Для использования подпишись на @{CHANNEL_USERNAME} 🙂")
+            return
+
+    tmp_path = await _download_largest_photo(bot, message)
+    await _process_and_send_palette(bot, message.chat.id, message.message_id, tmp_path)
+
+# ── КАНАЛ: новый пост с фото ──────────────────────────────────────────────────
+@dp.channel_post(F.photo)
+async def on_channel_photo(message: types.Message, bot: Bot):
+    # Подстрахуемся: реагируем только на нужный канал,
+    # если бот админ этого канала.
+    if message.chat.id != CHANNEL_ID:
+        log.info("Фото из другого канала (%s) проигнорировано", message.chat.id)
+        return
+
+    log.info("Канал: получено фото в %s (msg_id=%s)", message.chat.id, message.message_id)
+    tmp_path = await _download_largest_photo(bot, message)
+    await _process_and_send_palette(bot, message.chat.id, message.message_id, tmp_path)
+
+# ── ТЕХНИЧЕСКОЕ ───────────────────────────────────────────────────────────────
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в переменных окружения.")
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    log.info("Бот запущен. Канал: @%s (id=%s)", CHANNEL_USERNAME, CHANNEL_ID)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
     asyncio.run(main())
