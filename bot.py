@@ -1,4 +1,4 @@
-
+# bot.py
 import os
 import io
 import asyncio
@@ -7,163 +7,182 @@ from typing import List, Tuple
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message
+from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import CommandStart
 
-# ===== Канал (публичный username и числовой ID) =====
-CHANNEL_USERNAME = "assistantdesign"      # @assistantdesign
-CHANNEL_ID = -1002260787747               # -100...
+# ====== НАСТРОЙКИ КАНАЛА (как просили — вписаны явно) ======
+CHANNEL_USERNAME = "assistantdesign"        # t.me/assistantdesign
+CHANNEL_ID = -10020628787147                # числовой id канала
 
-# ===== Бот =====
+# ====== ЗАГРУЗКА ТОКЕНА И СОЗДАНИЕ БОТА ======
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("Env var TELEGRAM_BOT_TOKEN is not set")
+    raise RuntimeError("Env var TELEGRAM_BOT_TOKEN is missing")
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)  # aiogram 3.7+
+)
+
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# ---------- k-means на чистом NumPy (без sklearn) ----------
-def kmeans_colors(pixels: np.ndarray, k: int = 5, iters: int = 12, seed: int = 42) -> np.ndarray:
-    """
-    pixels: (N,3) uint8
-    return: (k,3) float64 центроиды
-    """
-    rng = np.random.default_rng(seed)
+# ====== УТИЛИТЫ ДЛЯ ПАЛИТРЫ ======
 
-    # k-means++ (упрощённо)
-    centroids = pixels[rng.choice(len(pixels), size=1, replace=False)].astype(np.float64)
-    for _ in range(1, k):
-        d2 = np.min(((pixels[:, None, :] - centroids[None, :, :]) ** 2).sum(axis=2), axis=1)
-        s = d2.sum()
-        probs = d2 / s if s > 0 else np.ones_like(d2) / len(d2)
-        centroids = np.vstack([centroids, pixels[rng.choice(len(pixels), p=probs)].astype(np.float64)])
-
-    for _ in range(iters):
-        d2 = ((pixels[:, None, :] - centroids[None, :, :]) ** 2).sum(axis=2)
-        labels = np.argmin(d2, axis=1)
-
-        new_centroids = []
-        for j in range(k):
-            cluster = pixels[labels == j]
-            if len(cluster) == 0:
-                new_centroids.append(pixels[rng.integers(0, len(pixels))].astype(np.float64))
-            else:
-                new_centroids.append(cluster.mean(axis=0))
-        new_centroids = np.vstack(new_centroids)
-
-        if np.allclose(new_centroids, centroids):
-            centroids = new_centroids
-            break
-        centroids = new_centroids
-
-    return centroids
-
-def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
+def _to_hex(rgb: Tuple[int, int, int]) -> str:
     return "#{:02x}{:02x}{:02x}".format(*rgb).lower()
 
-def build_palette_image(colors: List[Tuple[int,int,int]], size=(900, 320)) -> Image.Image:
-    w, h = size
-    n = len(colors)
-    pad = 4
-    text_h = 48
-    sw_h = h - text_h - pad*3
-    sw_w = (w - pad*(n+1)) // n
+def extract_palette(img: Image.Image, k: int = 5) -> List[Tuple[int, int, int]]:
+    """
+    Берём k доминирующих цветов через KMeans (scikit-learn),
+    предварительно уменьшаем изображение для скорости.
+    """
+    # лёгкая нормализация
+    img = img.convert("RGB")
+    img_small = img.resize((300, 300))
+    arr = np.array(img_small).reshape(-1, 3).astype(np.float32)
 
-    img = Image.new("RGB", (w, h), "white")
-    draw = ImageDraw.Draw(img)
+    # KMeans (склейка оттенков)
+    # Склеим кластеры детерминированно для повторяемости
+    from sklearn.cluster import KMeans
+    km = KMeans(n_clusters=k, n_init=10, random_state=42)
+    labels = km.fit_predict(arr)
+    centers = km.cluster_centers_.astype(np.uint8)
 
-    # подобрать шрифт (с запасными вариантами)
-    font = None
-    for name in ["DejaVuSans.ttf", "Arial.ttf"]:
-        try:
-            font = ImageFont.truetype(name, 22)
-            break
-        except Exception:
-            pass
-    if font is None:
+    # Отсортируем по размеру кластера (частоте вхождений)
+    counts = np.bincount(labels)
+    order = np.argsort(counts)[::-1]
+
+    palette = [tuple(map(int, centers[i])) for i in order]
+    return palette
+
+def draw_palette_card(palette: List[Tuple[int, int, int]]) -> Image.Image:
+    """
+    Рисуем карточку 1000x560: сверху полосы цветов, снизу подписи HEX.
+    """
+    width, height = 1000, 560
+    pad = 30
+    swatch_h = 320
+    gap = 12
+
+    card = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(card)
+
+    n = len(palette)
+    swatch_w = (width - pad*2 - gap*(n-1)) // n
+
+    # Полосы цветов
+    x = pad
+    for rgb in palette:
+        draw.rectangle([x, pad, x + swatch_w, pad + swatch_h], fill=rgb)
+        x += swatch_w + gap
+
+    # Подписи HEX под каждой полосой
+    # Подберём простой системный шрифт (на сервере не гарантированы TTF)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 32)
+    except:
         font = ImageFont.load_default()
 
-    for i, c in enumerate(colors):
-        x0 = pad + i*(sw_w + pad)
-        y0 = pad
-        x1 = x0 + sw_w
-        y1 = y0 + sw_h
-        draw.rectangle([x0, y0, x1, y1], fill=tuple(c))
+    x = pad
+    y_text = pad + swatch_h + 40
 
-        hex_code = rgb_to_hex(tuple(c))
-        text = hex_code
-        tw, th = draw.textbbox((0,0), text, font=font)[2:]
-        draw.text((x0 + (sw_w - tw)//2, y1 + pad), text, fill="black", font=font)
+    for rgb in palette:
+        hex_code = _to_hex(rgb)
+        # рамка под текст, чтобы читалось
+        text_w, text_h = draw.textbbox((0, 0), hex_code, font=font)[2:]
+        cx = x + swatch_w // 2
+        tx = cx - text_w // 2
+        draw.text((tx, y_text), hex_code, fill=(30, 30, 30), font=font)
+        x += swatch_w + gap
 
-    return img
+    return card
 
-async def process_photo(message: Message):
-    # берём максимальное фото
-    photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    data = await bot.download_file(file.file_path)
-    img = Image.open(io.BytesIO(data.read())).convert("RGB")
+# ====== ХЕНДЛЕРЫ ======
 
-    # уменьшим, чтобы ускорить кластеризацию
-    max_side = 512
-    if max(img.size) > max_side:
-        img.thumbnail((max_side, max_side))
+@router.message(CommandStart())
+async def cmd_start(msg: types.Message):
+    text = (
+        "Привет! Я анализирую изображения и вытаскиваю доминирующие цвета.\n\n"
+        f"Добавьте меня админом в канал <b>@{CHANNEL_USERNAME}</b>, "
+        "публикуйте фото — я пришлю палитру в ответ к посту."
+    )
+    await msg.answer(text)
 
-    arr = np.array(img, dtype=np.uint8)
-    pixels = arr.reshape(-1, 3)
+@router.message(F.chat.type == "channel", F.photo)
+async def on_channel_photo(msg: types.Message):
+    # Обрабатываем ТОЛЬКО наш канал
+    if msg.chat.id != CHANNEL_ID:
+        return
 
-    # кластеризация
-    k = 5
-    centroids = kmeans_colors(pixels, k=k)
+    try:
+        # Берём самое большое превью
+        file_id = msg.photo[-1].file_id
 
-    # пересчитаем близость для подсчёта долей (чтобы отсортировать по популярности)
-    d2 = ((pixels[:, None, :] - centroids[None, :, :]) ** 2).sum(axis=2)
-    labels = np.argmin(d2, axis=1)
-    counts = np.bincount(labels, minlength=k)
-    order = np.argsort(-counts)  # по убыванию
+        # Скачиваем в память
+        buf = io.BytesIO()
+        await bot.download(file_id, destination=buf)
+        buf.seek(0)
 
-    top = [tuple(np.clip(centroids[i].round().astype(int), 0, 255)) for i in order]
+        # Анализ цвета
+        img = Image.open(buf)
+        palette = extract_palette(img, k=5)
+        card = draw_palette_card(palette)
 
-    # картинка-палитра
-    palette_img = build_palette_image(top)
+        # Готовим буфер с картинкой‑карточкой
+        out = io.BytesIO()
+        card.save(out, format="PNG")
+        out.seek(0)
+
+        # Текст подписи
+        hex_list = " • ".join(_to_hex(rgb) for rgb in palette)
+        caption = f"Палитра: {hex_list}"
+
+        # Отправляем в ответ на пост
+        await bot.send_photo(
+            chat_id=msg.chat.id,
+            photo=out,
+            caption=caption,
+            reply_to_message_id=msg.message_id
+        )
+
+    except Exception as e:
+        # Лог в канал (в ответ) — чтобы видеть причину, если что-то пойдёт не так
+        await bot.send_message(
+            chat_id=msg.chat.id,
+            text=f"⚠️ Ошибка при обработке изображения: <code>{e}</code>",
+            reply_to_message_id=msg.message_id
+        )
+
+# (Необязательно) можно слушать личку, если кто-то пришлёт фото боту напрямую
+@router.message(F.chat.type.in_({"private"}), F.photo)
+async def on_private_photo(msg: types.Message):
+    file_id = msg.photo[-1].file_id
     buf = io.BytesIO()
-    palette_img.save(buf, format="PNG")
+    await bot.download(file_id, destination=buf)
     buf.seek(0)
 
-    # подпись
-    hex_list = [rgb_to_hex(c) for c in top]
-    caption = "Палитра: " + "  ".join(hex_list)
+    img = Image.open(buf)
+    palette = extract_palette(img, k=5)
+    card = draw_palette_card(palette)
 
-    # отправляем туда, откуда пришло
-    await message.reply_photo(buf, caption=caption)
+    out = io.BytesIO()
+    card.save(out, format="PNG")
+    out.seek(0)
 
-# ---------- Хэндлеры ----------
+    hex_list = "\n".join(_to_hex(rgb) for rgb in palette)
+    await msg.answer_photo(out, caption=f"Палитра:\n{hex_list}")
 
-@router.message(F.text == "/start")
-async def on_start(message: Message):
-    await message.answer(
-        "Привет! Пришлите фото — я сделаю палитру (HEX).\n"
-        "Работаю и в личке, и в канале @assistantdesign (нужно быть подписчиком)."
-    )
-
-# Личка: фото
-@router.message(F.chat.type == "private", F.photo)
-async def on_private_photo(message: Message):
-    await process_photo(message)
-
-# Канал: фото (бот должен быть админом с правом «Управление сообщениями»)
-@router.message(F.chat.type == "channel", F.photo)
-async def on_channel_photo(message: Message):
-    # дополнительная страховка: обрабатываем только наш канал
-    if message.chat.id in (CHANNEL_ID,):
-        await process_photo(message)
+# ====== ЗАПУСК ПОЛЛИНГА ======
 
 async def main():
-    print("Bot is starting...")
-    await dp.start_polling(bot, allowed_updates=["message"])
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
