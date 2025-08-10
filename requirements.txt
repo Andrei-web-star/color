@@ -1,4 +1,4 @@
-requests==2.31.0
+python-telegram-bot==20.3
 Pillow==11.0.0
 numpy==1.26.4
-scikit-learn==1.2.2
+requests==2.31.0
