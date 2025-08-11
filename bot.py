@@ -1,271 +1,278 @@
-import asyncio
 import io
-import logging
 import os
+import math
+import random
 from typing import List, Tuple
 
-import numpy as np
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatMemberStatus
-from aiogram.exceptions import TelegramConflictError
-from aiogram.filters import CommandStart
-from aiogram.types import BufferedInputFile, Message
+from aiogram.enums import ParseMode
+from aiogram.client.default_bot_properties import DefaultBotProperties
+from aiogram.types import Message, BufferedInputFile
+from aiogram.filters import Command
+
 from PIL import Image, ImageDraw, ImageFont
-from sklearn.cluster import KMeans
+import numpy as np
 
 
-# ========= Конфигурация =========
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Нет переменной окружения TELEGRAM_BOT_TOKEN")
+# ── настройки ──────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # на Render переменная окружения
+NUM_COLORS = 12                               # хотим всегда 12 цветов
+MAX_SIDE = 512                                # до какого размера сжимать картинку
+SEED = 13                                     # детерминированность k-means
 
-CHANNEL_USERNAME = "@desbalances"  # проверка подписки по username канала
-NUM_COLORS = 12                     # сколько цветов в палитре
-CARD_COLUMNS = 3
-CARD_ROWS = 4
-TILE_W, TILE_H = 340, 240           # размер “плитки” цвета
-PADDING = 24                        # отступы вокруг сетки
-GAP = 18                            # расстояние между плитками
-BG_COLOR = (245, 245, 245)          # фон карточки
-
-
-# ========= Логирование =========
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s",
+WELCOME = (
+    "Привет! Я —  генератор цветов от ДИЗ БАЛАНС 🎨 "
+    "Отправь мне фото, а я тебе отправлю его цветовую палитру в ответ."
 )
-log = logging.getLogger("color-bot")
 
 
-# ========= Утилки =========
-def pil_to_bytes(pil: Image.Image, fmt="PNG") -> bytes:
-    buf = io.BytesIO()
-    pil.save(buf, format=fmt)
-    return buf.getvalue()
+# ── утилиты цвета ──────────────────────────────────────────────────────────────
+def rgb_to_hsv(c: np.ndarray) -> np.ndarray:
+    """RGB [0..255] -> HSV [H 0..360, S 0..1, V 0..1] для массива (N,3)."""
+    c = c.astype(np.float32) / 255.0
+    r, g, b = c[:, 0], c[:, 1], c[:, 2]
+    mx = np.max(c, axis=1)
+    mn = np.min(c, axis=1)
+    diff = mx - mn + 1e-6
+
+    h = np.zeros_like(mx)
+    mask = mx == r
+    h[mask] = (60 * ((g[mask] - b[mask]) / diff[mask]) + 360) % 360
+    mask = mx == g
+    h[mask] = (60 * ((b[mask] - r[mask]) / diff[mask]) + 120) % 360
+    mask = mx == b
+    h[mask] = (60 * ((r[mask] - g[mask]) / diff[mask]) + 240) % 360
+
+    s = diff / (mx + 1e-6)
+    v = mx
+    return np.stack([h, s, v], axis=1)
 
 
-def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
+def hsv_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """Эвклидова метрика в HSV с учётом круговой оси Hue."""
+    dh = np.minimum(np.abs(a[0] - b[0]), 360 - np.abs(a[0] - b[0])) / 180.0  # [0..1]
+    ds = np.abs(a[1] - b[1])
+    dv = np.abs(a[2] - b[2])
+    # веса: hue важнее, чем S/V
+    return math.sqrt((1.6 * dh) ** 2 + (1.0 * ds) ** 2 + (1.0 * dv) ** 2)
+
+
+def hex_color(rgb: Tuple[int, int, int]) -> str:
     return "#{:02x}{:02x}{:02x}".format(*rgb)
 
 
-def downscale(img: Image.Image, max_side: int = 800) -> Image.Image:
-    w, h = img.size
-    scale = max(w, h) / max_side if max(w, h) > max_side else 1.0
-    if scale > 1:
-        img = img.resize((int(w / scale), int(h / scale)), Image.Resampling.LANCZOS)
-    return img
+# ── лёгкий K-Means без sklearn ────────────────────────────────────────────────
+def kmeans(pixels: np.ndarray, k: int, iters: int = 12, seed: int = 13) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Возвращает (centroids[k,3], labels[n]) для RGB-пикселей.
+    Простой MiniBatch: берём небольшие батчи для устойчивости и скорости.
+    """
+    rng = np.random.default_rng(seed)
+    n = pixels.shape[0]
+    # инициализация центров случайной подвыборкой
+    centers = pixels[rng.choice(n, size=min(k, n), replace=False)].astype(np.float32)
+    if centers.shape[0] < k:  # если пикселей мало — дублируем
+        reps = k - centers.shape[0]
+        centers = np.vstack([centers, centers[rng.choice(centers.shape[0], reps, replace=True)]])
+    # основной цикл
+    for _ in range(iters):
+        # мини-батч
+        batch_idx = rng.choice(n, size=min(5000, n), replace=False)
+        batch = pixels[batch_idx].astype(np.float32)
+        # принадлежности
+        dists = np.sum((batch[:, None, :] - centers[None, :, :]) ** 2, axis=2)  # (B, k)
+        labels = np.argmin(dists, axis=1)
+        # обновление центров
+        for i in range(k):
+            mask = labels == i
+            if np.any(mask):
+                centers[i] = batch[mask].mean(axis=0)
+    # финальные метки на всех пикселях
+    dists_all = np.sum((pixels[:, None, :].astype(np.float32) - centers[None, :, :]) ** 2, axis=2)
+    labels_all = np.argmin(dists_all, axis=1)
+    return centers.astype(np.uint8), labels_all
 
 
-def extract_palette(img: Image.Image, n_final: int = 12, oversample: int = 28) -> List[Tuple[int, int, int]]:
+def ensure_diverse_palette(centers: np.ndarray, counts: np.ndarray, need: int) -> List[Tuple[int, int, int]]:
     """
-    1) уменьшаем изображение, берём случайную подвыборку пикселей;
-    2) KMeans с k=oversample -> грубые центры;
-    3) удаляем очень похожие центры;
-    4) farthest-point sampling до n_final для разнообразия.
+    Берём больше кластеров, затем жёстко удаляем дубли по HSV-дистанции,
+    и жадно набираем не менее `need` цветов, сохраняя разнообразие.
     """
+    # сортируем центры по вкладу (частоте)
+    idx = np.argsort(counts)[::-1]
+    centers = centers[idx]
+    counts = counts[idx]
+
+    hsv = rgb_to_hsv(centers)
+    picked = []
+    picked_hsv = []
+    min_dist = 0.22  # порог "дубликата" (эмпирически)
+
+    for i, c in enumerate(centers):
+        chsv = hsv[i]
+        if not picked:
+            picked.append(tuple(int(x) for x in c))
+            picked_hsv.append(chsv)
+            continue
+        # проверяем на "слишком близко"
+        if all(hsv_distance(chsv, ph) >= min_dist for ph in picked_hsv):
+            picked.append(tuple(int(x) for x in c))
+            picked_hsv.append(chsv)
+        if len(picked) == need:
+            break
+
+    # если не хватило — добираем ближайшие «не очень разные»
+    j = 0
+    while len(picked) < need and j < len(centers):
+        c = centers[j]
+        t = tuple(int(x) for x in c)
+        if t not in picked:
+            picked.append(t)
+        j += 1
+
+    # если и так не хватило (крайне однотонная картинка) — дублируем/джиттерим
+    while len(picked) < need:
+        base = random.choice(picked)
+        # лёгкий джиттер ±6
+        jitter = tuple(int(max(0, min(255, base[i] + random.randint(-6, 6)))) for i in range(3))
+        picked.append(jitter)
+
+    return picked[:need]
+
+
+def extract_palette(img: Image.Image, need: int = NUM_COLORS) -> List[Tuple[int, int, int]]:
+    """Устойчивая палитра с разнообразием, без падений на однотонных фото."""
+    # приводим к RGB и уменьшаем
     img = img.convert("RGB")
-    img_small = downscale(img, 600)
-    X = np.array(img_small).reshape(-1, 3).astype(np.float32)
+    w, h = img.size
+    scale = min(1.0, MAX_SIDE / max(w, h))
+    if scale < 1.0:
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    # Сэмплим до 50к пикселей для скорости
-    if len(X) > 50_000:
-        idx = np.random.choice(len(X), 50_000, replace=False)
-        X = X[idx]
+    arr = np.array(img)  # (H, W, 3)
+    # сэмплируем пиксели (чтобы не было слишком много)
+    pixels = arr.reshape(-1, 3)
+    n = pixels.shape[0]
+    if n > 120_000:
+        rng = np.random.default_rng(SEED)
+        pixels = pixels[rng.choice(n, size=120_000, replace=False)]
 
-    # KMeans oversample
-    k = max(n_final + 8, oversample)
-    km = KMeans(n_clusters=k, n_init="auto", random_state=42)
-    km.fit(X)
-    centers = km.cluster_centers_.astype(int)
+    # немного фильтра: убираем явный шум — почти-белые и почти-чёрные забьём позже
+    mask_white = np.all(pixels > 248, axis=1)
+    mask_black = np.all(pixels < 7, axis=1)
+    core = pixels[~(mask_white | mask_black)]
+    if core.shape[0] < 500:
+        core = pixels  # слишком однотонное — работаем со всем
 
-    # Удаляем дублёры (слишком близкие центры)
-    keep = []
-    thr = 12.0  # порог близости в RGB
-    for c in centers:
-        if all(np.linalg.norm(c - np.array(p)) > thr for p in keep):
-            keep.append(tuple(c.tolist()))
-    centers = np.array(keep, dtype=np.float32)
+    # кластеризуем с запасом, потом схлопываем
+    k_init = max(need * 3, need + 6)
+    centers, labels = kmeans(core, k=k_init, iters=14, seed=SEED)
+    # считаем размеры кластеров
+    counts = np.bincount(labels, minlength=centers.shape[0])
 
-    # Если после чистки центров меньше, чем надо — просто добираем
-    if len(centers) <= n_final:
-        chosen = centers
-    else:
-        # Farthest Point Sampling (максимально разнообразные цвета)
-        chosen = []
-        # стартуем с самого “среднего” центра по сумме расстояний
-        dist_sum = ((centers[None, :, :] - centers[:, None, :]) ** 2).sum(axis=2) ** 0.5
-        start_idx = int(np.argmin(dist_sum.sum(axis=1)))
-        chosen.append(centers[start_idx])
+    # чистим дубли и набираем разнообразие
+    picked = ensure_diverse_palette(centers, counts, need)
 
-        remain = np.delete(centers, start_idx, axis=0)
-        dmin = np.linalg.norm(remain - chosen[0], axis=1)
+    # дополнительная сортировка: по покрытию (поиск ближайшего центра)
+    # — чтобы сверху шли более "доминирующие" тона
+    def nearest_count(c):
+        # находим ближайший центр из исходных и берём его размер
+        dif = np.sum((centers.astype(np.int16) - np.array(c, np.int16)) ** 2, axis=1)
+        j = int(np.argmin(dif))
+        return int(counts[j])
 
-        for _ in range(n_final - 1):
-            j = int(np.argmax(dmin))
-            chosen.append(remain[j])
-            remain = np.delete(remain, j, axis=0)
-            if len(remain) == 0:
-                break
-            dmin = np.minimum(dmin, np.linalg.norm(remain - chosen[-1], axis=1))
-
-        chosen = np.array(chosen)
-
-    # Сортируем по “светлоте” для аккуратного вида (формула luma)
-    def luma(c):
-        r, g, b = c
-        return 0.2126 * r + 0.7152 * g + 0.0722 * b
-
-    colors = sorted([tuple(map(int, c)) for c in chosen], key=luma, reverse=True)
-    # финально — ровно n_final (если вдруг больше/меньше)
-    colors = (colors + colors[:n_final])[:n_final]
-    return colors
+    picked.sort(key=nearest_count, reverse=True)
+    return picked[:need]
 
 
-def _text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> Tuple[int, int]:
-    """Совместимо с Pillow 10/11: вместо textsize используем textbbox."""
-    bbox = draw.textbbox((0, 0), text, font=font)
-    return (bbox[2] - bbox[0], bbox[3] - bbox[1])
+# ── рендер карточки 3×4 ───────────────────────────────────────────────────────
+def render_palette_card(colors: List[Tuple[int, int, int]]) -> bytes:
+    cols, rows = 3, 4
+    assert len(colors) >= cols * rows
+    sw, sh = 260, 160            # размер плитки
+    pad = 24                      # отступы
+    gap = 18                      # расстояние между плитками
+    label_h = 42                  # место под HEX
 
+    W = pad * 2 + cols * sw + (cols - 1) * gap
+    H = pad * 2 + rows * (sh + label_h) + (rows - 1) * gap
+    img = Image.new("RGB", (W, H), (250, 250, 250))
+    draw = ImageDraw.Draw(img)
 
-def render_palette_card(colors: List[Tuple[int, int, int]]) -> Image.Image:
-    """Рисуем карточку 3x4 с подписями HEX под каждым цветом."""
-    cols, rows = CARD_COLUMNS, CARD_ROWS
-    assert len(colors) == cols * rows
-
-    W = PADDING * 2 + cols * TILE_W + (cols - 1) * GAP
-    H = PADDING * 2 + rows * TILE_H + (rows - 1) * GAP
-    card = Image.new("RGB", (W, H), BG_COLOR)
-    draw = ImageDraw.Draw(card)
-
-    # Шрифт: сначала пытаемся взять DejaVuSans, иначе – системный
     try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 44)
+        # системный шрифт может отсутствовать — не критично
+        font = ImageFont.truetype("DejaVuSans.ttf", 26)
     except Exception:
         font = ImageFont.load_default()
 
-    for i, color in enumerate(colors):
-        cx = i % cols
-        cy = i // cols
-        x = PADDING + cx * (TILE_W + GAP)
-        y = PADDING + cy * (TILE_H + GAP)
+    k = 0
+    for r in range(rows):
+        for c in range(cols):
+            x = pad + c * (sw + gap)
+            y = pad + r * (sh + label_h + gap)
 
-        # сам цвет
-        draw.rounded_rectangle(
-            (x, y, x + TILE_W, y + TILE_H - 70),
-            radius=32,
-            fill=tuple(color),
-            outline=(230, 230, 230),
-            width=3,
-        )
+            color = colors[k]
+            k += 1
 
-        # подпись
-        hex_text = rgb_to_hex(color)
-        tw, th = _text_size(draw, hex_text, font)
-        tx = x + (TILE_W - tw) // 2
-        ty = y + TILE_H - 60
+            # прямоугольник цвета
+            draw.rectangle([x, y, x + sw, y + sh], fill=color, outline=(230, 230, 230))
 
-        # контрастный цвет текста
-        r, g, b = color
-        text_color = (0, 0, 0) if (0.2126*r + 0.7152*g + 0.0722*b) > 140 else (255, 255, 255)
+            # подпись HEX
+            text = hex_color(color)
+            # заменяем устаревший textsize -> textbbox
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
 
-        # лёгкая подложка для читаемости
-        draw.rounded_rectangle((tx - 10, ty - 6, tx + tw + 10, ty + th + 6), radius=10, fill=(255, 255, 255, 200))
-        draw.text((tx, ty), hex_text, font=font, fill=text_color)
+            tx = x + (sw - tw) // 2
+            ty = y + sh + (label_h - th) // 2
 
-    return card
+            # легкая подложка для читабельности
+            draw.rounded_rectangle([tx - 8, ty - 4, tx + tw + 8, ty + th + 4], radius=6, fill=(255, 255, 255))
+            draw.text((tx, ty), text, fill=(30, 30, 30), font=font)
+
+    bio = io.BytesIO()
+    img.save(bio, format="PNG", optimize=True)
+    return bio.getvalue()
 
 
-# ========= Проверка подписки =========
-async def is_subscribed(bot: Bot, user_id: int) -> bool:
+# ── телеграм-бот ──────────────────────────────────────────────────────────────
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher()
+
+
+@dp.message(Command("start"))
+async def on_start(message: Message):
+    await message.answer(WELCOME)
+
+
+@dp.message(F.photo)
+async def on_photo(message: Message):
     try:
-        m = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        return m.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR}
-    except Exception as e:
-        log.warning("check subscription failed: %s", e)
-        # если не смогли проверить — считаем не подписан
-        return False
+        # скачиваем лучшее качество
+        file = await bot.download(message.photo[-1].file_id)
+        file.seek(0)
+        img = Image.open(file)
 
-
-# ========= Хэндлеры =========
-async def on_start(message: Message, bot: Bot):
-    if not await is_subscribed(bot, message.from_user.id):
-        kb = (
-            "[Подписаться](https://t.me/desbalances)  •  "
-            "[Проверить подписку](/start)"
-        )
-        await message.answer(
-            "Чтобы пользоваться генератором, нужно быть **подписчиком канала** @desbalances.\n\n"
-            "Нажми «Подписаться», вернись и снова нажми /start.",
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-        )
-        await message.answer(kb, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-        return
-
-    await message.answer(
-        "Привет! Я —  генератор цветов от ДИЗ БАЛАНС 🎨 "
-        "Отправь мне **фото**, а я тебе отправлю его **цветовую палитру** в ответ.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def on_photo(message: Message, bot: Bot):
-    # проверка подписки перед обработкой
-    if not await is_subscribed(bot, message.from_user.id):
-        await on_start(message, bot)
-        return
-
-    try:
-        photo = message.photo[-1]
-        file = await bot.get_file(photo.file_id)
-        buf = io.BytesIO()
-        await bot.download(file, destination=buf)
-        buf.seek(0)
-
-        img = Image.open(buf).convert("RGB")
-        colors = extract_palette(img, n_final=NUM_COLORS)
-        card = render_palette_card(colors)
-        png = pil_to_bytes(card, "PNG")
-
-        caption = "Палитра: " + "  ".join(rgb_to_hex(c) for c in colors)
+        colors = extract_palette(img, need=NUM_COLORS)
+        png_bytes = render_palette_card(colors)
 
         await message.answer_photo(
-            photo=BufferedInputFile(png, filename="palette.png"),
-            caption=caption,
+            photo=BufferedInputFile(png_bytes, filename="palette.png"),
+            caption="Палитра: " + " ".join(hex_color(c) for c in colors[:NUM_COLORS])
         )
-
     except Exception as e:
-        log.exception("process failed")
-        await message.answer(
-            f"Ошибка обработки: {type(e).__name__}. Попробуйте другое фото или ещё раз."
-        )
+        # не падаем и даём понятное сообщение
+        await message.answer(f"Ошибка обработки: {type(e).__name__}. Попробуйте другое фото или ещё раз.")
 
 
-# ========= Запуск =========
 async def main():
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    dp = Dispatcher()
-    dp.message.register(on_start, CommandStart())
-    dp.message.register(on_photo, F.photo)
-
-    log.info("color-bot: бот запущен. Канал: %s", CHANNEL_USERNAME)
-
-    # защита от «409 Conflict»: просто один polling; если Render создаст дубликат — Telegram отрежет его
-    while True:
-        try:
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-        except TelegramConflictError:
-            # другая копия уже читает updates
-            log.error("Conflict: уже запущен другой инстанс. Жду и пробую снова…")
-            await asyncio.sleep(5)
-        except Exception:
-            log.exception("Polling crashed, restart in 3s")
-            await asyncio.sleep(3)
+    print("color-bot: бот запущен.")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
