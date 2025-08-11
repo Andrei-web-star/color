@@ -9,12 +9,20 @@ from sklearn.cluster import KMeans
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.enums import ChatMemberStatus
 
 # ────────────────────────────
 # Конфиг
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN".lower())
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("telegram_bot_token")
 if not BOT_TOKEN:
     raise RuntimeError("Env var TELEGRAM_BOT_TOKEN is empty")
+
+# юзернейм канала без @ — можно переопределить переменной окружения CHANNEL_USERNAME
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "desbalances")
 
 START_TEXT = (
     "Привет! Я —  генератор цветов от ДИЗ БАЛАНС 🎨 "
@@ -111,34 +119,83 @@ async def build_palette(bot: Bot, message: types.Message) -> tuple[io.BytesIO, L
         return None
 
 # ────────────────────────────
+# Подписка
+
+async def is_subscribed(bot: Bot, user_id: int) -> bool:
+    try:
+        m = await bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
+        return m.status in {
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.CREATOR,
+            ChatMemberStatus.OWNER,
+        }
+    except Exception:
+        return False
+
+def subscribe_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📌 ПОДПИСАТЬСЯ", url=f"https://t.me/{CHANNEL_USERNAME}"),
+        InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub"),
+    ]])
+
+# ────────────────────────────
 # Хендлеры
 
-async def cmd_start(message: types.Message):
+async def cmd_start(message: Message, bot: Bot):
+    if not await is_subscribed(bot, message.from_user.id):
+        await message.answer(
+            "Эта функция доступна только для подписчиков канала.\n"
+            "Подпишитесь и нажмите «Проверить подписку».",
+            reply_markup=subscribe_kb()
+        )
+        return
     await message.answer(START_TEXT)
 
-async def handle_private_photo(message: types.Message, bot: Bot):
+@types.CallbackQuery.filter(F.data == "check_sub")
+async def on_check_sub(cb: CallbackQuery, bot: Bot):
+    if await is_subscribed(bot, cb.from_user.id):
+        await cb.message.answer("Спасибо! Подписка подтверждена. Пришлите фото — пришлю палитру из 12 цветов.")
+    else:
+        await cb.answer("Ещё нет подписки 🤏", show_alert=True)
+
+async def handle_private_photo(message: Message, bot: Bot):
+    if not await is_subscribed(bot, message.from_user.id):
+        await message.answer(
+            "Доступ только для подписчиков канала.\n"
+            "Подпишитесь и нажмите «Проверить подписку».",
+            reply_markup=subscribe_kb()
+        )
+        return
+
     result = await build_palette(bot, message)
     if not result:
         await message.reply("Не удалось обработать изображение. Попробуйте другое фото.")
         return
     img_bytes, hex_list = result
     caption = "Палитра: " + " ".join(hex_list)
-    await message.reply_photo(types.BufferedInputFile(img_bytes.read(), "palette.png"),
-                              caption=caption)
+    data = img_bytes.getvalue()
+    await message.reply_photo(types.BufferedInputFile(data, "palette.png"), caption=caption)
 
-async def handle_channel_photo(channel_post: types.Message, bot: Bot):
+async def handle_channel_photo(channel_post: Message, bot: Bot):
+    # для канала проверка не нужна — бот должен быть админом в самом канале
     result = await build_palette(bot, channel_post)
     if not result:
-        await bot.send_message(channel_post.chat.id,
-                               "Не удалось обработать изображение. Попробуйте другое фото.",
-                               reply_to_message_id=channel_post.message_id)
+        await bot.send_message(
+            channel_post.chat.id,
+            "Не удалось обработать изображение. Попробуйте другое фото.",
+            reply_to_message_id=channel_post.message_id
+        )
         return
     img_bytes, hex_list = result
     caption = "Палитра: " + " ".join(hex_list)
-    await bot.send_photo(channel_post.chat.id,
-                         types.BufferedInputFile(img_bytes.read(), "palette.png"),
-                         caption=caption,
-                         reply_to_message_id=channel_post.message_id)
+    data = img_bytes.getvalue()
+    await bot.send_photo(
+        channel_post.chat.id,
+        types.BufferedInputFile(data, "palette.png"),
+        caption=caption,
+        reply_to_message_id=channel_post.message_id
+    )
 
 # ────────────────────────────
 # Запуск
@@ -148,6 +205,8 @@ async def main():
     dp = Dispatcher()
 
     dp.message.register(cmd_start, CommandStart())
+    dp.callback_query.register(on_check_sub, F.data == "check_sub")
+
     dp.message.register(handle_private_photo, F.photo)
     dp.channel_post.register(handle_channel_photo, F.photo)
 
