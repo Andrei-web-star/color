@@ -1,7 +1,5 @@
+
 aiogram==3.7.0
-requests
-Pillow
+Pillow==11.0.0
 numpy==1.26.4
 scikit-learn==1.3.2
-matplotlib==3.8.4
-reportlab==4.2.0
