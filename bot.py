@@ -16,7 +16,7 @@ from reportlab.pdfgen import canvas
 logging.basicConfig(level=logging.INFO)
 
 # Токен бота из переменных окружения
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # Создание бота и диспетчера
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
