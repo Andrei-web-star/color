@@ -1,212 +1,88 @@
 
 import os
 import io
-import asyncio
-import logging
-from typing import List, Tuple
-
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from aiogram import Bot, Dispatcher, F, types
+from PIL import Image
+import matplotlib.pyplot as plt
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, FSInputFile
 from aiogram.enums import ParseMode
-from aiogram.client.default_bot_properties import DefaultBotProperties
+from aiogram.filters import Command
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+import asyncio
 
-# ── Конфиг ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Нет TELEGRAM_BOT_TOKEN в переменных окружения.")
+# Настройки
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Токен бота из Render → Environment
+CHANNEL_ID = "@DesignAssistant"  # username канала или ID
 
-# Эти два можно оставить пустыми — они нужны только если хочешь
-# жёстко дублировать ответы еще и в конкретный канал.
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1002608781747"))      # твой канал
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "assistantdesign")
-
-# Сколько цветов выводим
-PALETTE_SIZE = 12
-
-# ── Инициализация ────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s"
-)
-log = logging.getLogger("color-bot")
-
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
+# Генерация палитры
+def generate_palette(image_path, num_colors=12):
+    image = Image.open(image_path).convert('RGB')
+    image = image.resize((200, 200))  # ускоряем обработку
+    data = np.array(image).reshape(-1, 3)
 
-# ── Утилиты ──────────────────────────────────────────────────────────────────
-def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
-    return "#{:02x}{:02x}{:02x}".format(*rgb)
+    # кластеризация цветов (k-means)
+    from sklearn.cluster import KMeans
+    kmeans = KMeans(n_clusters=num_colors, random_state=0).fit(data)
+    colors = np.array(kmeans.cluster_centers_, dtype=int)
 
-def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont):
-    """Безопасно получаем размеры текста (совместимо с разными версиями Pillow)."""
-    try:
-        # pillow ≥ 8.0
-        bbox = draw.textbbox((0, 0), text, font=font)
-        return bbox[2] - bbox[0], bbox[3] - bbox[1]
-    except Exception:
-        try:
-            # старые версии
-            return draw.textsize(text, font=font)  # type: ignore
-        except Exception:
-            # fallback
-            return font.getlength(text), font.size  # type: ignore
+    # Рисуем палитру
+    fig, ax = plt.subplots(1, 1, figsize=(12, 2))
+    for i, color in enumerate(colors):
+        ax.add_patch(plt.Rectangle((i, 0), 1, 1, color=np.array(color) / 255))
+        ax.text(i + 0.5, -0.5, '#%02x%02x%02x' % tuple(color),
+                ha='center', va='top', fontsize=10)
+    ax.set_xlim(0, num_colors)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
 
-
-def dominant_colors_pil(img: Image.Image, k: int) -> List[Tuple[Tuple[int, int, int], int]]:
-    """
-    Выбираем k доминирующих цветов без sklearn:
-    1) уменьшаем картинку
-    2) используем медианный квантайзер PIL (MEDIANCUT)
-    3) собираем частоты цветов и возвращаем top-k
-    """
-    img_small = img.convert("RGB").resize((256, 256), Image.LANCZOS)
-    q = img_small.quantize(colors=k, method=Image.MEDIANCUT)
-    q_rgb = q.convert("RGB")
-    colors = q_rgb.getcolors(256 * 256) or []
-    # сортируем по частоте убыв.
-    colors.sort(key=lambda c: c[0], reverse=True)
-    # colors: List[(count, (r,g,b))]
-    return [(rgb, count) for count, rgb in colors[:k]]
-
-
-def build_palette_image(colors: List[Tuple[Tuple[int, int, int], int]]) -> bytes:
-    """
-    Собираем карточку 3×4 (12 цветов) с HEX подписями.
-    На выход — PNG в bytes.
-    """
-    # Канва
-    cols = 3
-    rows = 4
-    sw = 520   # ширина свотча
-    sh = 240   # высота свотча
-    pad = 32   # внутренние отступы
-    label_h = 72
-
-    W = cols * sw + (cols + 1) * pad
-    H = rows * (sh + label_h) + (rows + 1) * pad
-
-    canvas = Image.new("RGB", (W, H), (245, 245, 245))
-    draw = ImageDraw.Draw(canvas)
-
-    # Шрифт: используем встроенный по умолчанию
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 42)
-    except Exception:
-        font = ImageFont.load_default()
-
-    for i, (rgb, _cnt) in enumerate(colors):
-        r, g, b = rgb
-        hex_code = rgb_to_hex((r, g, b))
-        row = i // cols
-        col = i % cols
-
-        x0 = pad + col * (sw + pad)
-        y0 = pad + row * (sh + label_h + pad)
-        # прямоугольник цвета
-        draw.rectangle([x0, y0, x0 + sw, y0 + sh], fill=(r, g, b))
-
-        # подложка под подпись
-        draw.rectangle([x0, y0 + sh, x0 + sw, y0 + sh + label_h], fill=(255, 255, 255))
-
-        # подпись по центру
-        tw, th = text_size(draw, hex_code, font)
-        tx = x0 + (sw - tw) // 2
-        ty = y0 + sh + (label_h - th) // 2
-        # Цвет текста контрастный к фону свотча — возьмём тёмно-серый
-        draw.text((tx, ty), hex_code, fill=(30, 30, 30), font=font)
-
-    bio = io.BytesIO()
-    canvas.save(bio, format="PNG")
-    bio.seek(0)
-    return bio.getvalue()
-
-
-async def download_photo_as_image(message: types.Message) -> Image.Image:
-    """
-    Скачиваем наибольшее превью фото в память и открываем как PIL.Image
-    """
-    largest = message.photo[-1]
     buf = io.BytesIO()
-    await bot.download(largest, destination=buf)
+    plt.savefig(buf, format='png', bbox_inches='tight')
     buf.seek(0)
-    return Image.open(buf)
+    plt.close(fig)
+    return buf
 
-
-# ── Хэндлеры ─────────────────────────────────────────────────────────────────
-@dp.message(F.text == "/start")
-async def cmd_start(message: types.Message):
-    text = (
-        "Привет! Я — генератор цветов от ДИЗ БАЛАНС 🎨 "
-        "Отправь мне фото, а я тебе отправлю его цветовую палитру в ответ."
+# Команда /start
+@dp.message(Command("start"))
+async def start_cmd(message: Message):
+    await message.answer(
+        "Привет! Я — генератор цветов от ДИЗ БАЛАНС 🎨\n"
+        "Отправь мне фото, а я тебе пришлю палитру из 12 цветов."
     )
-    await message.answer(text)
 
-
+# Обработка фото
 @dp.message(F.photo)
-async def on_photo(message: types.Message):
-    chat = message.chat
-    is_channel = chat.type == "channel"
-
+async def handle_photo(message: Message):
     try:
-        # 1) грузим фото
-        img = await download_photo_as_image(message)
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        file_path = file.file_path
 
-        # 2) считаем 12 доминирующих цветов
-        colors = dominant_colors_pil(img, PALETTE_SIZE)
-        # на всякий пожарный — добьём до 12, если вдруг меньше
-        if len(colors) < PALETTE_SIZE:
-            colors = (colors + colors)[:PALETTE_SIZE]
+        # скачиваем файл
+        image_data = await bot.download_file(file_path)
+        temp_path = "temp.jpg"
+        with open(temp_path, "wb") as f:
+            f.write(image_data.read())
 
-        # 3) строим карточку
-        png_bytes = build_palette_image(colors)
+        # генерируем палитру
+        palette_buf = generate_palette(temp_path)
 
-        # 4) текст с HEX (строкой)
-        hex_list = " ".join(rgb_to_hex(rgb) for rgb, _ in colors)
-        caption = f"Палитра: {hex_list}"
+        # отправляем пользователю
+        await message.answer_photo(photo=palette_buf, caption="Вот палитра 🎨")
 
-        # 5) отправляем ответ
-        photo = types.BufferedInputFile(png_bytes, filename="palette.png")
-
-        if is_channel:
-            # ответ в тред к публикации канала
-            await bot.send_photo(
-                chat_id=chat.id,
-                photo=photo,
-                caption=caption,
-                reply_to_message_id=message.message_id
-            )
-        else:
-            # личка
-            await message.answer_photo(photo=photo, caption=caption)
-
-        # опционально дублируем в конкретный канал:
-        # (закомментируй, если не нужно)
-        try:
-            await bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=types.BufferedInputFile(png_bytes, filename="palette.png"),
-                caption=caption
-            )
-        except Exception as e:
-            log.warning("Не удалось продублировать в канал: %s", e)
+        # отправляем в канал
+        palette_buf.seek(0)
+        await bot.send_photo(CHANNEL_ID, photo=palette_buf, caption="Новая палитра 🎨")
 
     except Exception as e:
-        log.exception("Ошибка обработки фото: %s", e)
-        err_text = "Не удалось обработать изображение. Попробуйте другое фото."
-        if is_channel:
-            await bot.send_message(chat.id, err_text, reply_to_message_id=message.message_id)
-        else:
-            await message.answer(err_text)
+        await message.answer("Не удалось обработать изображение. Попробуйте другое фото.")
+        print("Ошибка:", e)
 
-
-# ── Точка входа ──────────────────────────────────────────────────────────────
+# Запуск
 async def main():
-    log.info("color-bot | Бот запускаем. Канал: @%s (id=%s)", CHANNEL_USERNAME, CHANNEL_ID)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
