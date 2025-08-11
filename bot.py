@@ -9,11 +9,7 @@ from sklearn.cluster import KMeans
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton
-)
-from aiogram.enums import ChatMemberStatus
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
 # ────────────────────────────
 # Конфиг
@@ -21,16 +17,22 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("telegram_bot_token")
 if not BOT_TOKEN:
     raise RuntimeError("Env var TELEGRAM_BOT_TOKEN is empty")
 
-# юзернейм канала без @ — можно переопределить переменной окружения CHANNEL_USERNAME
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "desbalances")
+CHANNEL_USERNAME = "desbalances"                # наш канал (без @)
+CHANNEL_LINK = f"https://t.me/{CHANNEL_USERNAME}"
 
 START_TEXT = (
     "Привет! Я —  генератор цветов от ДИЗ БАЛАНС 🎨 "
     "Отправь мне фото, а я тебе отправлю его цветовую палитру в ответ."
 )
 
+# Клавиатура для неподписчиков
+kb_sub = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="📌 Подписаться", url=CHANNEL_LINK)],
+    [InlineKeyboardButton(text="Проверить подписку", callback_data="check_sub")]
+])
+
 # ────────────────────────────
-# Утилиты
+# Утилиты рисования/аналитики
 
 def pil_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     for name in ("DejaVuSans.ttf", "Arial.ttf"):
@@ -44,26 +46,44 @@ def to_hex(rgb: Tuple[int, int, int]) -> str:
     return "#{:02x}{:02x}{:02x}".format(*rgb)
 
 def extract_dominant_colors(image: Image.Image, k: int = 12) -> List[Tuple[int, int, int]]:
+    """KMeans по RGB, но:
+       - уменьшаем картинку до макс. стороны 400
+       - ограничиваем k числом уникальных цветов
+       - сортируем по частоте (чтобы палитра «серединная», но разнообразная)"""
     img = image.convert("RGB")
     max_side = 400
     w, h = img.size
     scale = min(max_side / max(w, h), 1.0)
     if scale < 1.0:
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
     arr = np.asarray(img).reshape(-1, 3).astype(np.float32)
 
-    kmeans = KMeans(n_clusters=k, n_init=4, random_state=42)
+    # Сколько реально уникальных цветов
+    uniq = np.unique(arr.astype(np.uint8), axis=0)
+    k_eff = int(min(k, max(1, len(uniq))))
+
+    kmeans = KMeans(n_clusters=k_eff, n_init=6, random_state=42)
     labels = kmeans.fit_predict(arr)
     centers = kmeans.cluster_centers_.astype(np.uint8)
 
-    counts = np.bincount(labels, minlength=k)
+    counts = np.bincount(labels, minlength=k_eff)
     order = np.argsort(-counts)
-    return [tuple(int(x) for x in centers[i]) for i in order]
+
+    colors = [tuple(int(x) for x in centers[i]) for i in order]
+
+    # если уникальных < 12 — «дополняем» близкими к среднему оттенками,
+    # чтобы карточка всегда была на 12 свотчей
+    while len(colors) < k:
+        mean = tuple(int(x) for x in np.mean(centers, axis=0))
+        colors.append(mean)
+
+    return colors[:k]
 
 def draw_palette(colors: List[Tuple[int, int, int]], cols=3, rows=4) -> Image.Image:
     assert cols * rows == len(colors)
 
-    sw, sh = 280, 220        # размер свотча
+    sw, sh = 280, 220
     pad, gap = 24, 24
     caption_h = 56
 
@@ -119,52 +139,40 @@ async def build_palette(bot: Bot, message: types.Message) -> tuple[io.BytesIO, L
         return None
 
 # ────────────────────────────
-# Подписка
+# Проверка подписки
 
 async def is_subscribed(bot: Bot, user_id: int) -> bool:
     try:
-        m = await bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
-        return m.status in {
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.CREATOR,
-            ChatMemberStatus.OWNER,
-        }
+        member = await bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
+        return member.status in {"member", "administrator", "creator"}
     except Exception:
+        # если бот не админ канала — get_chat_member не сработает
         return False
-
-def subscribe_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📌 ПОДПИСАТЬСЯ", url=f"https://t.me/{CHANNEL_USERNAME}"),
-        InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub"),
-    ]])
 
 # ────────────────────────────
 # Хендлеры
 
-async def cmd_start(message: Message, bot: Bot):
+async def cmd_start(message: types.Message, bot: Bot):
     if not await is_subscribed(bot, message.from_user.id):
         await message.answer(
-            "Эта функция доступна только для подписчиков канала.\n"
-            "Подпишитесь и нажмите «Проверить подписку».",
-            reply_markup=subscribe_kb()
+            "Доступ только для подписчиков канала. Подпишитесь и нажмите «Проверить подписку».",
+            reply_markup=kb_sub
         )
         return
     await message.answer(START_TEXT)
 
-@types.CallbackQuery.filter(F.data == "check_sub")
-async def on_check_sub(cb: CallbackQuery, bot: Bot):
-    if await is_subscribed(bot, cb.from_user.id):
-        await cb.message.answer("Спасибо! Подписка подтверждена. Пришлите фото — пришлю палитру из 12 цветов.")
+async def on_check_sub(callback: types.CallbackQuery, bot: Bot):
+    ok = await is_subscribed(bot, callback.from_user.id)
+    if ok:
+        await callback.message.edit_text(START_TEXT)
     else:
-        await cb.answer("Ещё нет подписки 🤏", show_alert=True)
+        await callback.answer("Пока не вижу подписку. Подпишись и нажми ещё раз.", show_alert=True)
 
-async def handle_private_photo(message: Message, bot: Bot):
+async def handle_private_photo(message: types.Message, bot: Bot):
     if not await is_subscribed(bot, message.from_user.id):
         await message.answer(
-            "Доступ только для подписчиков канала.\n"
-            "Подпишитесь и нажмите «Проверить подписку».",
-            reply_markup=subscribe_kb()
+            "Доступ только для подписчиков канала. Подпишитесь и нажмите «Проверить подписку».",
+            reply_markup=kb_sub
         )
         return
 
@@ -172,13 +180,16 @@ async def handle_private_photo(message: Message, bot: Bot):
     if not result:
         await message.reply("Не удалось обработать изображение. Попробуйте другое фото.")
         return
+
     img_bytes, hex_list = result
     caption = "Палитра: " + " ".join(hex_list)
-    data = img_bytes.getvalue()
-    await message.reply_photo(types.BufferedInputFile(data, "palette.png"), caption=caption)
+    await message.reply_photo(
+        BufferedInputFile(img_bytes.read(), "palette.png"),
+        caption=caption
+    )
 
-async def handle_channel_photo(channel_post: Message, bot: Bot):
-    # для канала проверка не нужна — бот должен быть админом в самом канале
+async def handle_channel_photo(channel_post: types.Message, bot: Bot):
+    # бот должен быть админом в канале @desbalances
     result = await build_palette(bot, channel_post)
     if not result:
         await bot.send_message(
@@ -187,12 +198,12 @@ async def handle_channel_photo(channel_post: Message, bot: Bot):
             reply_to_message_id=channel_post.message_id
         )
         return
+
     img_bytes, hex_list = result
     caption = "Палитра: " + " ".join(hex_list)
-    data = img_bytes.getvalue()
     await bot.send_photo(
         channel_post.chat.id,
-        types.BufferedInputFile(data, "palette.png"),
+        BufferedInputFile(img_bytes.read(), "palette.png"),
         caption=caption,
         reply_to_message_id=channel_post.message_id
     )
@@ -201,16 +212,20 @@ async def handle_channel_photo(channel_post: Message, bot: Bot):
 # Запуск
 
 async def main():
-    bot = Bot(token=BOT_TOKEN)  # без DefaultBotProperties и без parse_mode
+    bot = Bot(token=BOT_TOKEN)          # без parse_mode и DefaultBotProperties
     dp = Dispatcher()
 
+    # команды/кнопки
     dp.message.register(cmd_start, CommandStart())
     dp.callback_query.register(on_check_sub, F.data == "check_sub")
 
+    # фото в ЛС
     dp.message.register(handle_private_photo, F.photo)
+
+    # фото в канале (бот должен быть админом канала)
     dp.channel_post.register(handle_channel_photo, F.photo)
 
-    print("color-bot | Бот запущен. Ждём апдейты…")
+    print("color-bot | Бот запущен. Канал: @desbalances")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
