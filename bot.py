@@ -1,214 +1,180 @@
 # bot.py
 import asyncio
+import io
 import logging
 import os
-from io import BytesIO
 from typing import List, Tuple
 
 import numpy as np
-import requests
 from PIL import Image, ImageDraw, ImageFont
 from sklearn.cluster import KMeans
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
-from aiogram.types import Message, Update
-from aiogram.client.session.middlewares.request_logging import logger as aio_logger
-from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, BufferedInputFile, FSInputFile
 
-# ------------------ Конфиг ------------------
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN".upper()) or os.getenv("TOKEN")
-CHANNEL_USERNAME = "@assistantdesign"          # публичный @username канала
-CHANNEL_ID = -1002608781747                    # numeric id канала (оставьте как у вас)
-
-# Безопасный parse_mode для aiogram 3.7+: задаётся в DefaultBotProperties на старте
-DEFAULT_PARSE_MODE = ParseMode.HTML
-
-# ------------------ Логирование ------------------
+# ---------- базовая настройка ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s | %(name)s: %(message)s"
+    format="%(asctime)s %(levelname)s | %(name)s | %(message)s"
 )
 log = logging.getLogger("color-bot")
-aio_logger.setLevel(logging.WARNING)
 
-# ------------------ Утилиты ------------------
-def fetch_file_bytes(url: str) -> bytes:
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return r.content
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Env var TELEGRAM_BOT_TOKEN is not set")
 
-def extract_palette(img: Image.Image, k: int = 4) -> List[Tuple[int, int, int]]:
-    # уменьшаем для скорости, убираем альфу
-    img = img.convert("RGB").resize((256, int(256 * img.height / max(1, img.width))))
-    data = np.array(img).reshape(-1, 3)
+# aiogram 3.7: parse_mode передаём через DefaultBotProperties
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
-    # иногда попадаются почти-одноцветные фото — KMeans может падать
-    unique = np.unique(data, axis=0)
-    k = min(k, len(unique))
-    if k < 2:
-        return [tuple(int(v) for v in unique[0])]  # один цвет
+# Для текста на палитре: попробуем встроенный шрифт
+try:
+    FONT = ImageFont.truetype("DejaVuSans.ttf", 28)
+except Exception:
+    FONT = ImageFont.load_default()
 
-    km = KMeans(n_clusters=k, n_init=3, random_state=42)
-    km.fit(data)
-    centers = km.cluster_centers_.astype(int)
-    return [tuple(map(int, c)) for c in centers]
 
-def _text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> Tuple[int, int]:
-    """
-    Универсальный способ посчитать размер текста для Pillow 9/10/11:
-    сначала пробуем textbbox, если нет — textlength/textsize.
-    """
-    if hasattr(draw, "textbbox"):
-        l, t, r, b = draw.textbbox((0, 0), text, font=font)
-        return r - l, b - t
-    # запасной путь
-    if hasattr(draw, "textlength"):
-        w = int(draw.textlength(text, font=font))
-        # высоту берём из bbox шрифта
-        try:
-            _, _, _, b = font.getbbox("Hg")  # примерно x-height
-            h = b
-        except Exception:
-            h = font.size + 4
-        return w, h
-    # совсем старый Pillow
-    return draw.textsize(text, font=font)
-
-def hex_color(rgb: Tuple[int, int, int]) -> str:
+# ---------- утилиты цвета ----------
+def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
     return "#{:02x}{:02x}{:02x}".format(*rgb)
 
-def render_palette(colors: List[Tuple[int, int, int]]) -> Image.Image:
-    sw = 220              # ширина одного сэмпла
-    h = 180               # высота карточки
-    gap = 12              # отступ между блоками
-    pad = 20
-    total_w = pad * 2 + sw * len(colors) + gap * (len(colors) - 1)
-    img = Image.new("RGB", (total_w, h), (245, 245, 245))
-    d = ImageDraw.Draw(img)
 
-    # шрифт
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 20)
-    except Exception:
-        font = ImageFont.load_default()
+def get_text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
+    # Pillow ≥10: используем textbbox
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
-    x = pad
-    for c in colors:
+
+def extract_palette(img: Image.Image, k: int = 4) -> List[Tuple[int, int, int]]:
+    # уменьшаем для скорости/стабильности
+    img_small = img.copy()
+    img_small.thumbnail((300, 300))
+    arr = np.array(img_small).reshape(-1, 3)
+
+    # уберём полностью белые и полностью чёрные точки (меньше шума)
+    mask = ~(
+        ((arr <= 5).all(axis=1)) |
+        ((arr >= 250).all(axis=1))
+    )
+    arr = arr[mask] if mask.any() else arr
+
+    # кластеризация
+    km = KMeans(n_clusters=k, n_init=8, random_state=42)
+    km.fit(arr)
+    centers = np.rint(km.cluster_centers_).astype(int)
+    # сортируем по "важности" (частоте)
+    counts = np.bincount(km.labels_)
+    order = np.argsort(-counts)[:k]
+    palette = [tuple(centers[i]) for i in order]
+    return palette
+
+
+def build_palette_image(palette: List[Tuple[int, int, int]], swatch_w=240, swatch_h=120, gap=4) -> Image.Image:
+    k = len(palette)
+    cols = min(k, 2)
+    rows = (k + cols - 1) // cols
+
+    cell_w = swatch_w
+    cell_h = swatch_h
+    pad = 12
+
+    out_w = cols * cell_w + (cols + 1) * gap + pad * 2
+    out_h = rows * (cell_h + 40) + (rows + 1) * gap + pad * 2  # + место под текст
+
+    img = Image.new("RGB", (out_w, out_h), (245, 245, 245))
+    draw = ImageDraw.Draw(img)
+
+    for idx, rgb in enumerate(palette):
+        r, c = divmod(idx, cols)
+        x = pad + gap + c * (cell_w + gap)
+        y = pad + gap + r * (cell_h + 40 + gap)
+
         # прямоугольник цвета
-        rect_h = h - 60
-        d.rectangle([x, pad, x + sw, pad + rect_h], fill=c)
+        draw.rectangle([x, y, x + cell_w, y + cell_h], fill=rgb)
 
-        # подписи
-        rgb_text = f"{c[0]},{c[1]},{c[2]}"
-        hex_text = hex_color(c)
+        # обводка
+        draw.rectangle([x, y, x + cell_w, y + cell_h], outline=(0, 0, 0), width=1)
 
-        w1, _ = _text_size(d, rgb_text, font)
-        w2, _ = _text_size(d, hex_text, font)
-
-        d.text((x + (sw - w1) // 2, pad + rect_h + 8), rgb_text, fill=(0, 0, 0), font=font)
-        d.text((x + (sw - w2) // 2, pad + rect_h + 34), hex_text, fill=(0, 0, 0), font=font)
-
-        x += sw + gap
+        # подпись HEX
+        hex_text = rgb_to_hex(rgb)
+        tw, th = get_text_size(draw, hex_text, FONT)
+        tx = x + (cell_w - tw) // 2
+        ty = y + cell_h + 8
+        # фон подписи для контраста
+        draw.rounded_rectangle([tx - 6, ty - 4, tx + tw + 6, ty + th + 4], radius=6, fill=(255, 255, 255))
+        draw.text((tx, ty), hex_text, font=FONT, fill=(0, 0, 0))
 
     return img
 
-async def reply_palette(bot: Bot, target_chat_id: int, reply_to_message_id: int, img_bytes: bytes):
-    with Image.open(BytesIO(img_bytes)) as im:
-        colors = extract_palette(im, k=4)
-    palette_img = render_palette(colors)
-    bio = BytesIO()
-    palette_img.save(bio, format="PNG")
-    bio.seek(0)
-    await bot.send_photo(
-        target_chat_id,
-        bio,
-        caption="Палитра доминирующих цветов",
-        reply_to_message_id=reply_to_message_id
-    )
 
-# ------------------ Хендлеры ------------------
-async def on_start(message: Message, bot: Bot):
+async def process_and_reply(message: Message) -> None:
+    """
+    Скачивает фото из сообщения, строит палитру и присылает её ответом.
+    Работает и в ЛС, и в канале (ответом к посту).
+    """
+    try:
+        # берём самое большое превью
+        photo = message.photo[-1]
+        buf = io.BytesIO()
+        await bot.download(photo, destination=buf)
+        buf.seek(0)
+
+        img = Image.open(buf).convert("RGB")
+        palette = extract_palette(img, k=4)
+        pal_img = build_palette_image(palette)
+
+        out = io.BytesIO()
+        pal_img.save(out, format="PNG")
+        out.seek(0)
+
+        caption = "Палитра: " + "  ".join(rgb_to_hex(c) for c in palette)
+        await message.reply_photo(
+            BufferedInputFile(out.read(), filename="palette.png"),
+            caption=caption
+        )
+    except Exception as e:
+        log.exception("Ошибка при обработке фото")
+        await message.reply("Не удалось обработать изображение. Попробуйте другое фото.")
+
+
+# ---------- хендлеры ----------
+@dp.message(CommandStart())
+async def on_start(message: Message):
     text = (
         "Привет! Я анализирую изображения и вытаскиваю доминирующие цвета.\n\n"
-        f"Добавьте меня админом в канал {CHANNEL_USERNAME}, публикуйте фото — "
-        "я пришлю палитру в ответ к посту."
+        "Добавьте меня <b>админом</b> в канал <b>@assistantdesign</b>, публикуйте фото — "
+        "я пришлю палитру в ответ к посту.\n\n"
+        "Также можно прислать фото прямо сюда."
     )
     await message.answer(text)
 
-async def on_channel_photo(message: Message, bot: Bot):
-    try:
-        # берём самую большую версию фото
-        if not message.photo:
-            return
-        file_id = message.photo[-1].file_id
-        f = await bot.get_file(file_id)
-        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
-        img = fetch_file_bytes(file_url)
 
-        await reply_palette(bot, message.chat.id, message.message_id, img)
-    except Exception as e:
-        log.exception("Failed to process channel photo")
-        await bot.send_message(
-            message.chat.id,
-            "Не удалось обработать изображение. Попробуйте другое фото.",
-            reply_to_message_id=message.message_id
-        )
+# ЛС: пришлют фото
+@dp.message(F.photo)
+async def handle_private_photo(message: Message):
+    await process_and_reply(message)
 
-async def on_private_photo(message: Message, bot: Bot):
-    # тот же сценарий, но в личке
-    try:
-        file_id = message.photo[-1].file_id
-        f = await bot.get_file(file_id)
-        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
-        img = fetch_file_bytes(file_url)
-        await reply_palette(bot, message.chat.id, message.message_id, img)
-    except Exception:
-        log.exception("Failed to process direct photo")
-        await message.answer("Не удалось обработать изображение. Попробуйте другое фото.")
 
-# ------------------ Main ------------------
-async def run():
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN не найден в Environment Variables.")
+# Канал: новый фото-пост
+@dp.channel_post(F.photo)
+async def handle_channel_photo(message: Message):
+    await process_and_reply(message)
 
-    # aiogram 3.7+: parse_mode задаётся в default properties
-    bot = Bot(BOT_TOKEN, default=Bot.default_bot_properties(parse_mode=DEFAULT_PARSE_MODE))
-    dp = Dispatcher()
 
-    # команды
-    dp.message.register(on_start, CommandStart())
+# На всякий случай — альбомы (медиа-группы): берём последнюю фотографию
+@dp.channel_post(F.media_group_id, F.photo)
+async def handle_channel_album(message: Message):
+    await process_and_reply(message)
 
-    # канал: реагируем только на наш канал
-    dp.message.register(
-        on_channel_photo,
-        F.chat.type == "channel",
-        F.chat.username.as_("uname").map(lambda u: f"@{u}".lower() == CHANNEL_USERNAME.lower()),
-        F.photo
-    )
 
-    # личка
-    dp.message.register(on_private_photo, F.chat.type == "private", F.photo)
+# ---------- запуск ----------
+async def main():
+    log.info("Бот запускаем. Канал: @assistantdesign")
+    await dp.start_polling(bot)
 
-    log.info("бот запущен. Канал: %s (id=%s)", CHANNEL_USERNAME, CHANNEL_ID)
-
-    # Защита от двойного запуска (409 Conflict) — просто повторяем старт, если инстанс уже есть
-    retry = 0
-    while True:
-        try:
-            await dp.start_polling(bot, allowed_updates=Update.ALL_TYPES)
-        except TelegramConflictError:
-            retry += 1
-            wait = min(5, 0.8 + retry * 0.6)
-            log.warning("Conflict: уже есть активный инстанс. Ждём %.1fs и пробуем ещё…", wait)
-            await asyncio.sleep(wait)
-        except TelegramUnauthorizedError:
-            log.error("Bot token неверный или отозван.")
-            break
-        except Exception:
-            log.exception("Unhandled error in polling. Перезапуск через 2s…")
-            await asyncio.sleep(2)
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    asyncio.run(main())
