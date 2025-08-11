@@ -1,138 +1,340 @@
 import os
-import re
+import io
 import logging
-import asyncio
-from io import BytesIO
+from typing import List, Tuple
 
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from sklearn.cluster import KMeans
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message,
+    BufferedInputFile,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from aiogram.filters import CommandStart
-from aiogram.utils.token import TokenValidationError
+from aiogram.enums import ChatMemberStatus
 
-# ====== TOKEN ======
-API_TOKEN = os.getenv("API_TOKEN", "").strip()
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+from sklearn.cluster import MiniBatchKMeans
 
-def _validate_token(token: str):
-    # Формат: цифры:буквы/символы, минимум как у Telegram
-    if not token or not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", token):
-        raise TokenValidationError("Token is invalid!")
 
-_validate_token(API_TOKEN)
-# ===================
+# =========================
+# НАСТРОЙКИ
+# =========================
+CHANNEL_USERNAME = "desbalances"     # ваш канал @desbalances (без @)
+NUM_COLORS = 12                      # сколько цветов отдаём в палитре
+MAX_IMAGE_SIDE = 1024                # как сильно уменьшаем фото перед анализом
+SWATCHES_PER_ROW = 4                 # сетка 3x4
+PADDING = 32                         # отступы в карточке палитры
+GAP = 16                             # зазоры между плашками
+LABEL_HEIGHT = 36                    # место под подпись HEX
+BG_COLOR = (245, 245, 245)           # фон
+TEXT_COLOR = (30, 30, 30)            # текст
+FONT_PATH = None                     # можно положить .ttf рядом и указать имя файла
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=API_TOKEN)
+
+# =========================
+# ИНИЦИАЛИЗАЦИЯ
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger("color-bot")
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Переменная окружения TELEGRAM_BOT_TOKEN не задана.")
+
+bot = Bot(token=BOT_TOKEN)  # В aiogram 3: parse_mode сюда НЕ передаём
 dp = Dispatcher()
 
-# ====== Color utils ======
-def _rgb_to_lab(rgb_arr):
-    rgb = rgb_arr / 255.0
-    def inv_gamma(u):
-        return np.where(u <= 0.04045, u/12.92, ((u+0.055)/1.055)**2.4)
-    r, g, b = inv_gamma(rgb[:,0]), inv_gamma(rgb[:,1]), inv_gamma(rgb[:,2])
-    X = r*0.4124564 + g*0.3575761 + b*0.1804375
-    Y = r*0.2126729 + g*0.7151522 + b*0.0721750
-    Z = r*0.0193339 + g*0.1191920 + b*0.9503041
-    Xn, Yn, Zn = 0.95047, 1.00000, 1.08883
-    x, y, z = X/Xn, Y/Yn, Z/Zn
-    def f(t):
-        eps, kappa = 216/24389, 24389/27
-        return np.where(t > eps, np.cbrt(t), (kappa*t + 16)/116)
-    fx, fy, fz = f(x), f(y), f(z)
-    L = 116*fy - 16
-    a = 500*(fx - fy)
-    b = 200*(fy - fz)
-    return np.stack([L, a, b], axis=1)
 
-def extract_palette(image_bytes: bytes, n_colors=12, ignore_border=0.05,
-                    min_L=20, max_L=95, min_chroma=8):
-    from PIL import Image
-    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-    img_small = img.copy()
-    img_small.thumbnail((600, 600), Image.LANCZOS)
+# =========================
+# ВСПОМОГАТЕЛЬНОЕ
+# =========================
+def rgb_to_hex(color: Tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*color)
 
-    w, h = img_small.size
-    dx, dy = int(w*ignore_border), int(h*ignore_border)
-    img_crop = img_small.crop((dx, dy, w-dx, h-dy))
 
-    arr = np.array(img_crop).reshape(-1, 3)
-    if arr.size == 0:
-        return ['#000000']*n_colors
+def resize_image(im: Image.Image, max_side: int = MAX_IMAGE_SIDE) -> Image.Image:
+    w, h = im.size
+    scale = max(w, h) / float(max_side)
+    if scale > 1.0:
+        im = im.resize((int(w / scale), int(h / scale)), Image.LANCZOS)
+    return im
 
-    lab = _rgb_to_lab(arr)
-    L, a, b = lab[:,0], lab[:,1], lab[:,2]
-    chroma = np.sqrt(a*a + b*b)
 
-    mask = (L >= min_L) & (L <= max_L) & (chroma >= min_chroma)
-    if mask.sum() < max(1000, n_colors*50):
-        mask = (L >= 10) & (L <= 98)
+def preprocess_pixels(im: Image.Image) -> np.ndarray:
+    """
+    Готовим пиксели к кластеризации:
+    - уменьшаем изображение;
+    - переводим в RGB;
+    - слегка «разбавляем» выборку по яркости/насыщенности,
+      чтобы палитра получалась разнообразнее.
+    """
+    im = im.convert("RGB")
+    im = resize_image(im, MAX_IMAGE_SIDE)
+    arr = np.asarray(im, dtype=np.uint8)
+    h, w, _ = arr.shape
+    pixels = arr.reshape(-1, 3)
 
-    arr_f = arr[mask] if mask.any() else arr
-    k = min(n_colors, len(arr_f))
-    km = KMeans(n_clusters=k, n_init=8, random_state=42)
-    km.fit(arr_f)
-    centers = km.cluster_centers_.astype(int)
+    # Рассчитываем HSV «по‑бедному», без внешних зависимостей
+    # (нам нужны только V и S для стратифицированной подвыборки)
+    rgb = pixels.astype(np.float32) / 255.0
+    maxc = rgb.max(axis=1)
+    minc = rgb.min(axis=1)
+    v = maxc
+    s = np.where(maxc == 0, 0, (maxc - minc) / maxc)
 
-    centers_lab = _rgb_to_lab(centers)
-    order = np.argsort(centers_lab[:,0])  # по светлоте
+    # Стратифицированная выборка: берём побольше ярких/насыщенных пикселей,
+    # но не забываем и про тихие тона.
+    idx = np.arange(pixels.shape[0])
+    weight = 0.6 * v + 0.4 * s  # 0..1
+    weight = weight + 0.15      # базовый вес, чтобы не занулить серые
+    prob = weight / weight.sum()
+
+    sample_size = min(100_000, pixels.shape[0])  # достаточно для устойчивой KMeans
+    chosen = np.random.choice(idx, size=sample_size, replace=False, p=prob)
+    return pixels[chosen]
+
+
+def unique_colors(colors: np.ndarray, min_dist: float = 22.0) -> List[Tuple[int, int, int]]:
+    """
+    Удаляем слишком похожие кластеры.
+    min_dist — евклидова дистанция в RGB (0..442). 22 ~ заметная разница.
+    """
+    sel = []
+    for c in colors:
+        c = c.astype(int)
+        if not sel:
+            sel.append(c)
+            continue
+        d = np.sqrt(((np.array(sel) - c) ** 2).sum(axis=1))
+        if (d >= min_dist).all():
+            sel.append(c)
+    return [tuple(map(int, x)) for x in sel]
+
+
+def extract_palette(im: Image.Image, n: int = NUM_COLORS) -> List[Tuple[int, int, int]]:
+    """
+    KMeans по RGB + пост‑обработчик для разнообразия.
+    """
+    px = preprocess_pixels(im)
+    # Берём чуть больше, а потом отфильтруем похожие
+    n_clusters = int(n * 1.8)
+    n_clusters = max(n_clusters, n + 2)
+
+    kmeans = MiniBatchKMeans(
+        n_clusters=n_clusters,
+        random_state=42,
+        batch_size=4096,
+        max_no_improvement=20,
+        n_init="auto",
+    )
+    kmeans.fit(px)
+    centers = np.clip(kmeans.cluster_centers_.round(), 0, 255).astype(np.uint8)
+
+    # Сортируем по яркости (V)
+    rgb = centers.astype(np.float32) / 255.0
+    v = rgb.max(axis=1)
+    order = np.argsort(v)[::-1]  # от ярких к тёмным
     centers = centers[order]
 
-    return [f'#{r:02x}{g:02x}{b:02x}' for r, g, b in centers]
+    # Убираем дубликаты
+    palette = unique_colors(centers, min_dist=22.0)
 
-def build_palette_image(hex_colors, cols=4, swatch_size=220, margin=20, label_height=60):
-    from PIL import Image, ImageDraw, ImageFont
-    rows = int(np.ceil(len(hex_colors)/cols))
-    W = cols*swatch_size + (cols+1)*margin
-    H = rows*(swatch_size+label_height) + (rows+1)*margin
-    canvas = Image.new("RGB", (W, H), (255,255,255))
-    draw = ImageDraw.Draw(canvas)
+    # Если недостаточно — добавим из исходных центров
+    i = 0
+    while len(palette) < n and i < len(centers):
+        c = tuple(map(int, centers[i]))
+        if c not in palette:
+            palette.append(c)
+        i += 1
 
+    # Ровно n цветов
+    return palette[:n]
+
+
+def draw_palette_card(
+    palette: List[Tuple[int, int, int]],
+    swatches_per_row: int = SWATCHES_PER_ROW,
+    padding: int = PADDING,
+    gap: int = GAP,
+    label_h: int = LABEL_HEIGHT,
+) -> Image.Image:
+    rows = int(np.ceil(len(palette) / swatches_per_row))
+    # прикинем размеры карточки
+    swatch_w = 220
+    swatch_h = 140
+    card_w = padding * 2 + swatches_per_row * swatch_w + (swatches_per_row - 1) * gap
+    card_h = padding * 2 + rows * (swatch_h + label_h) + (rows - 1) * gap
+
+    img = Image.new("RGB", (card_w, card_h), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    # Шрифт
+    font = None
+    if FONT_PATH and os.path.exists(FONT_PATH):
+        try:
+            font = ImageFont.truetype(FONT_PATH, 22)
+        except Exception:
+            font = ImageFont.load_default()
+    else:
+        font = ImageFont.load_default()
+
+    x = padding
+    y = padding
+
+    for i, color in enumerate(palette):
+        # плашка
+        draw.rectangle(
+            [x, y, x + swatch_w, y + swatch_h],
+            fill=color,
+            outline=(220, 220, 220),
+            width=2,
+        )
+        # подпись
+        hex_text = rgb_to_hex(color)
+        tw, th = draw.textsize(hex_text, font=font)
+        tx = x + (swatch_w - tw) // 2
+        ty = y + swatch_h + (label_h - th) // 2
+        draw.text((tx, ty), hex_text, font=font, fill=TEXT_COLOR)
+
+        # следующий слот
+        if (i + 1) % swatches_per_row == 0:
+            x = padding
+            y += swatch_h + label_h + gap
+        else:
+            x += swatch_w + gap
+
+    return img
+
+
+async def is_channel_subscriber(user_id: int) -> bool:
+    """
+    true — подписан/админ/создатель; false — нет доступа.
+    """
     try:
-        font = ImageFont.truetype("Arial.ttf", 26)
-    except:
-        font = None
+        member = await bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
+        return member.status in {
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.CREATOR,
+            ChatMemberStatus.MEMBER,
+        }
+    except Exception as e:
+        logger.warning("Не удалось проверить подписку: %s", e)
+        return False
 
-    for i, hexc in enumerate(hex_colors):
-        row, col = divmod(i, cols)
-        x0 = margin + col*(swatch_size + margin)
-        y0 = margin + row*(swatch_size + label_height + margin)
-        color = tuple(int(hexc[j:j+2], 16) for j in (1,3,5))
-        draw.rectangle([x0, y0, x0+swatch_size, y0+swatch_size], fill=color)
-        draw.text((x0+10, y0+swatch_size+8), hexc, fill=(0,0,0), font=font)
 
-    return canvas
+def subscribe_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="📌 Подписаться",
+                url=f"https://t.me/{CHANNEL_USERNAME}"
+            ),
+            InlineKeyboardButton(
+                text="✅ Проверить подписку",
+                callback_data="check_sub"
+            ),
+        ]]
+    )
+
+
 # =========================
-
+# ХЕНДЛЕРЫ
+# =========================
 @dp.message(CommandStart())
-async def start(message: Message):
-    await message.answer("Привет! Отправь мне фото, и я сделаю палитру 🎨")
+async def on_start(message: Message):
+    user = message.from_user
+    if not user:
+        return
 
-@dp.message(lambda m: m.photo)
-async def handle_photo(message: Message):
+    ok = await is_channel_subscriber(user.id)
+    if not ok:
+        await message.answer(
+            "Этот бот доступен только для подписчиков канала.\n"
+            "Подпишитесь и нажмите «Проверить подписку».",
+            reply_markup=subscribe_keyboard(),
+        )
+        return
+
+    await message.answer(
+        "Привет! Я —  генератор цветов от ДИЗ БАЛАНС 🎨 "
+        "Отправь мне фото, а я тебе отправлю его цветовую палитру в ответ.\n\n"
+        "Пришли изображение одним файлом (не альбомом)."
+    )
+
+
+@dp.callback_query(F.data == "check_sub")
+async def on_check_sub(cb):
+    ok = await is_channel_subscriber(cb.from_user.id)
+    if ok:
+        await cb.message.edit_text(
+            "Готово! Вы подписаны ✅\nТеперь просто пришлите фото — пришлю палитру из 12 цветов."
+        )
+    else:
+        await cb.answer("Пока подписка не найдена 🤷‍♂️", show_alert=True)
+
+
+@dp.message(F.photo)
+async def on_photo(message: Message):
+    user = message.from_user
+    if not user:
+        return
+
+    # защита: не подписан — не обрабатываем
+    if not await is_channel_subscriber(user.id):
+        await message.answer(
+            "Этот бот доступен только подписчикам канала.\n"
+            "Подпишитесь и нажмите «Проверить подписку».",
+            reply_markup=subscribe_keyboard(),
+        )
+        return
+
     try:
-        file_id = message.photo[-1].file_id
-        file = await bot.get_file(file_id)
-        file_bytes = await bot.download_file(file.file_path)
-        image_bytes = file_bytes.read()
-
-        hex_list = extract_palette(image_bytes, n_colors=12)
-        palette_img = build_palette_image(hex_list)
-
-        buf = BytesIO()
-        palette_img.save(buf, format='PNG')
+        # берём самое большое превью
+        photo_size = message.photo[-1]
+        buf = io.BytesIO()
+        await bot.download(photo_size, destination=buf)
         buf.seek(0)
 
-        await message.answer_photo(buf, caption="Палитра:\n" + " ".join(hex_list))
-    except Exception as e:
-        logging.exception("process error")
-        await message.answer(f"Ошибка обработки: {e}")
+        with Image.open(buf) as im:
+            palette = extract_palette(im, n=NUM_COLORS)
+            card = draw_palette_card(palette)
 
+        out = io.BytesIO()
+        card.save(out, format="PNG")
+        out.seek(0)
+
+        photo = BufferedInputFile(out.getvalue(), filename="palette.png")
+        caption_lines = ["Палитра:"]
+        caption_lines.extend(rgb_to_hex(c) for c in palette)
+        caption = " ".join(caption_lines)
+
+        await message.answer_photo(photo=photo, caption=caption)
+
+    except Exception as e:
+        logger.exception("Ошибка обработки изображения: %s", e)
+        await message.answer(
+            "Не удалось обработать изображение. Попробуйте другое фото."
+        )
+
+
+@dp.message()
+async def on_other(message: Message):
+    await message.answer("Пришлите, пожалуйста, фото — я сделаю палитру из 12 цветов.")
+
+
+# =========================
+# main
+# =========================
 async def main():
-    logging.info("Bot starting…")
+    logger.info("Бот запускается. Канал: @%s", CHANNEL_USERNAME)
     await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
