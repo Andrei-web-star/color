@@ -1,6 +1,6 @@
+import asyncio
 import os
-import io
-import math
+from io import BytesIO
 from typing import List, Tuple
 
 import numpy as np
@@ -9,314 +9,248 @@ from sklearn.cluster import KMeans
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.enums import ChatType
-
-# ================== Настройки ==================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN".upper()) or os.getenv("TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Env var TELEGRAM_BOT_TOKEN is empty")
-
-# канал, подписка на который обязательна
-CHANNEL_USERNAME = "desbalances"  # без @
-CHANNEL_LINK = f"https://t.me/{CHANNEL_USERNAME}"
-
-# Сколько цветов в палитре
-PALETTE_K = 12
-
-# Размер карточки (на глаз под Telegram)
-CARD_W, CARD_H = 1024, 1280
-GRID_COLS, GRID_ROWS = 3, 4  # 12 ячеек
-MARGIN = 32
-CELL_GAP = 16
-LABEL_H = 54
-BORDER = 2
-
-WELCOME_TEXT = (
-    "Привет! Я —  генератор цветов от ДИЗ БАЛАНС 🎨 "
-    "Отправь мне фото, а я тебе отправлю его цветовую палитру в ответ."
+from aiogram.types import (
+    Message, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton,
+    ChatMemberLeft, ChatMemberBanned
 )
 
-# ================== Вспомогательные функции (цвет) ==================
-def _to_lab(img: Image.Image) -> np.ndarray:
-    lab = img.convert("LAB")
-    return np.asarray(lab, dtype=np.float32).reshape(-1, 3)
+# === Конфиг ===
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHANNEL_USERNAME = os.getenv("MAIN_CHANNEL_USERNAME", "desbalances")  # без @
+CHANNEL_LINK = f"https://t.me/{CHANNEL_USERNAME}"
 
-def _tile_sample(img: Image.Image, per_tile: int = 1200, tiles: int = 6) -> np.ndarray:
-    img = img.convert("RGB")
-    w, h = img.size
-    scale = 768 / max(w, h) if max(w, h) > 768 else 1.0
-    if scale < 1:
-        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+assert BOT_TOKEN, "Env TELEGRAM_BOT_TOKEN is required"
 
-    W, H = img.size
-    lab = np.asarray(img.convert("LAB"), dtype=np.float32)
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
 
-    xs = np.linspace(0, W, tiles + 1, dtype=int)
-    ys = np.linspace(0, H, tiles + 1, dtype=int)
-    parts = []
-    rng = np.random.default_rng(42)
-    for i in range(tiles):
-        for j in range(tiles):
-            x0, x1 = xs[i], xs[i+1]
-            y0, y1 = ys[j], ys[j+1]
-            tile = lab[y0:y1, x0:x1, :].reshape(-1, 3)
-            if len(tile) == 0:
-                continue
-            take = min(per_tile, len(tile))
-            idx = rng.choice(len(tile), take, replace=False)
-            parts.append(tile[idx])
-    if not parts:
-        return lab.reshape(-1, 3)
-    all_lab = np.concatenate(parts, axis=0)
+# Кэшируем id канала, чтобы уметь отвечать на посты канала
+_channel_id_cache: int | None = None
 
-    L = all_lab[:, 0]
-    keep = (L > 2) & (L < 98)
-    return all_lab[keep]
 
-def _prepare_pixels(im: Image.Image, sample: int = 200_000) -> np.ndarray:
-    lab = _tile_sample(im, per_tile=1200, tiles=6)
-    if len(lab) > sample:
-        idx = np.random.choice(len(lab), sample, replace=False)
-        lab = lab[idx]
-    return lab  # LAB
+async def get_channel_id() -> int:
+    global _channel_id_cache
+    if _channel_id_cache is None:
+        chat = await bot.get_chat(f"@{CHANNEL_USERNAME}")
+        _channel_id_cache = chat.id
+    return _channel_id_cache
 
-def _deltaE76(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.linalg.norm(a - b))
 
-def _lab_to_rgb_tuple(lab_vec: np.ndarray) -> Tuple[int, int, int]:
-    arr = lab_vec.reshape(1, 1, 3).astype(np.uint8)
-    pil_lab = Image.fromarray(arr, mode="LAB").convert("RGB")
-    r, g, b = pil_lab.getpixel((0, 0))
-    return int(r), int(g), int(b)
-
-def _kmeans_colors(pixels_lab: np.ndarray, k: int) -> List[Tuple[int, int, int]]:
-    k_over = max(18, int(k * 2 + 4))
-    km = KMeans(n_clusters=k_over, n_init=10, random_state=42)
-    labels = km.fit_predict(pixels_lab)
-    centers = km.cluster_centers_  # LAB
-    counts = np.bincount(labels, minlength=k_over)
-
-    Lvals = centers[:, 0]
-    order = np.lexsort((Lvals, -counts))
-    centers = centers[order]
-    counts = counts[order]
-
-    mean_lab = np.median(pixels_lab, axis=0)
-    dists = np.linalg.norm(centers - mean_lab, axis=1)
-    pick0 = int(np.argmin(dists))
-
-    selected = [centers[pick0]]
-
-    def binL(L):
-        if L < 35: return "dark"
-        if L > 70: return "light"
-        return "mid"
-
-    quotas = {"dark": 4, "mid": 4, "light": 4}
-    quotas[binL(centers[pick0, 0])] -= 1
-
-    min_de = 12.0
-    i = 0
-    while len(selected) < k and i < len(centers):
-        c = centers[i]
-        b = binL(c[0])
-        if quotas[b] <= 0:
-            i += 1
-            continue
-        ok = True
-        for s in selected:
-            if _deltaE76(c, s) < min_de:
-                ok = False
-                break
-        if ok:
-            selected.append(c)
-            quotas[b] -= 1
-        i += 1
-
-    i = 0
-    while len(selected) < k and i < len(centers):
-        c = centers[i]
-        ok = True
-        for s in selected:
-            if _deltaE76(c, s) < (min_de - 3):
-                ok = False
-                break
-        if ok:
-            selected.append(c)
-        i += 1
-
-    i = 0
-    while len(selected) < k and i < len(centers):
-        selected.append(centers[i])
-        i += 1
-
-    result_rgb = [_lab_to_rgb_tuple(lab) for lab in selected[:k]]
-
-    selected_lab = np.vstack(selected[:k])
-    sort_idx = np.lexsort((selected_lab[:, 2], selected_lab[:, 1], selected_lab[:, 0]))
-    result_rgb = [result_rgb[i] for i in sort_idx]
-    return result_rgb
-
-def _rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
-    return "#{:02x}{:02x}{:02x}".format(*rgb)
-
-# ================== Карточка палитры ==================
-def render_palette_card(colors: List[Tuple[int,int,int]], source_preview: Image.Image | None = None) -> Image.Image:
-    card = Image.new("RGB", (CARD_W, CARD_H), (245, 246, 250))
-    draw = ImageDraw.Draw(card)
-
-    # попытка взять системный шрифт (если нет — PIL default)
+# === Утилиты подписки ===
+async def is_subscriber(user_id: int) -> bool:
+    """
+    Возвращает True, если user_id подписан на канал.
+    """
     try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 40)
-        font_small = ImageFont.truetype("DejaVuSans.ttf", 34)
-    except:
-        font = ImageFont.load_default()
-        font_small = ImageFont.load_default()
-
-    # заголовок (опционально можно вернуть)
-    # draw.text((MARGIN, MARGIN), "Палитра", fill=(30,30,30), font=font)
-
-    grid_top = MARGIN
-    grid_left = MARGIN
-    grid_right = CARD_W - MARGIN
-    grid_bottom = CARD_H - MARGIN
-
-    cell_w = (grid_right - grid_left - (GRID_COLS - 1) * CELL_GAP) // GRID_COLS
-    cell_h = (grid_bottom - grid_top - (GRID_ROWS - 1) * CELL_GAP) // GRID_ROWS
-
-    # рисуем 12 ячеек
-    idx = 0
-    hexes = []
-    for r in range(GRID_ROWS):
-        for c in range(GRID_COLS):
-            if idx >= len(colors):
-                break
-            x = grid_left + c * (cell_w + CELL_GAP)
-            y = grid_top + r * (cell_h + CELL_GAP)
-
-            # прямоугольник цвета (оставим снизу место под подпись)
-            rect_h = cell_h
-            color = colors[idx]
-            draw.rounded_rectangle(
-                [x, y, x + cell_w, y + rect_h],
-                radius=18,
-                fill=color,
-                outline=(230, 232, 236),
-                width=BORDER
-            )
-
-            # подпись HEX (на нижней кромке, в «плашке» полупрозрачной)
-            hex_code = _rgb_to_hex(color)
-            hexes.append(hex_code)
-            text_w, text_h = draw.textbbox((0,0), hex_code, font=font_small)[2:]
-            pad = 10
-            box_h = text_h + pad*2
-            box_y = y + rect_h - box_h
-            draw.rectangle([x, box_y, x + cell_w, y + rect_h], fill=(255,255,255,128))
-            draw.text((x + (cell_w - text_w)//2, box_y + pad), hex_code, fill=(30,30,30), font=font_small)
-
-            idx += 1
-
-    # маленький превью исходника в левом верхнем углу (необязательно)
-    if source_preview is not None:
-        prev = source_preview.copy().convert("RGB")
-        pw = CARD_W // 5
-        ph = int(prev.height / prev.width * pw)
-        prev = prev.resize((pw, ph), Image.LANCZOS)
-        card.paste(prev, (CARD_W - pw - MARGIN, MARGIN))
-
-    return card, hexes
-
-# ================== Проверка подписки ==================
-async def is_subscriber(bot: Bot, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
-        status = getattr(member, "status", None)
-        # допустимые статусы
-        return status in ("creator", "administrator", "member") or getattr(member, "is_member", False)
+        member = await bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
+        if isinstance(member, (ChatMemberLeft, ChatMemberBanned)):
+            return False
+        return True
     except Exception:
-        # если канал закрыт для бота или бот не админ в канале — считаем не подписан
+        # Закрытые аккаунты/ограничения — считаем не подписан
         return False
 
-def subscribe_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
+
+def subscribe_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="📌 Подписаться", url=CHANNEL_LINK),
         InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")
     ]])
-    return kb
 
-# ================== Aiogram ==================
-bot = Bot(token=BOT_TOKEN)  # без parse_mode тут — 3.7.0 это не поддерживает
-dp = Dispatcher()
+
+# === Генерация палитры ===
+
+def _hex(c: Tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*c)
+
+def _prepare_pixels(im: Image.Image, sample: int = 160_000) -> np.ndarray:
+    # уменьшаем до ~512px по длинной стороне, конвертим к RGB
+    im = im.convert("RGB")
+    w, h = im.size
+    scale = 512 / max(w, h) if max(w, h) > 512 else 1.0
+    if scale < 1:
+        im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    arr = np.asarray(im).reshape(-1, 3).astype(np.float32)
+
+    # легкая фильтрация «шумов»: убираем почти-чисто белые/черные пиксели с малой вероятностью
+    # (не жестко, чтобы не потерять светлые/темные оттенки)
+    brightness = arr.mean(axis=1)
+    mask = np.ones(len(arr), dtype=bool)
+    mask &= ~((brightness < 5) | (brightness > 250))
+    arr = arr[mask]
+
+    # случайная подвыборка для скорости
+    if len(arr) > sample:
+        idx = np.random.choice(len(arr), sample, replace=False)
+        arr = arr[idx]
+    return arr
+
+def _kmeans_colors(pixels: np.ndarray, k: int) -> List[Tuple[int, int, int]]:
+    # KMeans с учетом частоты: центры в RGB
+    # sklearn>=1.2: n_init='auto' допустимо; для совместимости укажем конкретное число.
+    km = KMeans(n_clusters=k, n_init=10, random_state=42)
+    labels = km.fit_predict(pixels)
+    centers = km.cluster_centers_.astype(int)
+
+    # считаем частоты кластеров и сортируем по убыванию площади, затем по яркости
+    counts = np.bincount(labels, minlength=k)
+    lumin = centers.mean(axis=1)
+    order = np.lexsort((lumin, -counts))  # сначала по -counts, затем по lumin
+    centers = centers[order]
+    return [tuple(map(int, c)) for c in centers]
+
+def _draw_palette(colors: List[Tuple[int, int, int]], thumb: Image.Image | None) -> Image.Image:
+    """
+    Рисуем карточку 3x4 (12 цветов) с подписями HEX. Слева сверху — миниатюра исходного фото.
+    """
+    cols, rows = 4, 3
+    cell_w, cell_h = 260, 150
+    pad = 28
+    title_h = 68
+    thumb_box = 220  # миниатюра исходного
+
+    W = pad*2 + cols*cell_w
+    H = pad*3 + rows*cell_h + title_h + thumb_box
+
+    img = Image.new("RGB", (W, H), (245, 245, 245))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
+
+    # Заголовок
+    title = "Палитра (12 цветов)"
+    tb = draw.textbbox((0, 0), title, font=font)
+    draw.text(((W - (tb[2]-tb[0]))//2, pad), title, fill=(30,30,30), font=font)
+
+    # Миниатюра
+    if thumb:
+        t = thumb.convert("RGB")
+        tw, th = t.size
+        scale = min(thumb_box/tw, thumb_box/th, 1.0)
+        t = t.resize((int(tw*scale), int(th*scale)), Image.LANCZOS)
+        tx = pad
+        ty = title_h + pad
+        # рамка
+        draw.rectangle([tx-1, ty-1, tx+t.width+1, ty+t.height+1], outline=(200,200,200), width=2)
+        img.paste(t, (tx, ty))
+
+    # Сетка цветов
+    start_y = title_h + pad
+    # если вставили миниатюру, отодвинем сетку вправо
+    grid_offset_x = pad + thumb_box + pad if thumb else pad
+
+    def text_centered(rect, text):
+        x0, y0, x1, y1 = rect
+        bbox = draw.textbbox((0,0), text, font=font)
+        tx = x0 + (x1-x0 - (bbox[2]-bbox[0]))//2
+        ty = y0 + (y1-y0 - (bbox[3]-bbox[1]))//2
+        draw.text((tx, ty), text, fill=(30,30,30), font=font)
+
+    idx = 0
+    for r in range(rows):
+        for c in range(cols):
+            if idx >= len(colors): break
+            x0 = grid_offset_x + c*cell_w
+            y0 = start_y + r*cell_h
+            x1 = x0 + cell_w - pad//2
+            y1 = y0 + cell_h - pad//2
+
+            # прямоугольник цвета
+            color_rect = (x0+6, y0+6, x1-6, y0 + int((y1-y0)*0.6))
+            draw.rectangle(color_rect, fill=colors[idx], outline=(220,220,220), width=2)
+
+            # подпись
+            hex_text = _hex(colors[idx])
+            label_rect = (x0, color_rect[3]+8, x1, y1-6)
+            text_centered(label_rect, hex_text)
+            idx += 1
+
+    return img
+
+
+async def generate_palette_image(photo_bytes: bytes, k: int = 12) -> BytesIO:
+    original = Image.open(BytesIO(photo_bytes))
+    pixels = _prepare_pixels(original)
+    if len(pixels) < k:
+        raise RuntimeError("Недостаточно пикселей для кластеризации")
+
+    colors = _kmeans_colors(pixels, k)
+    card = _draw_palette(colors, original)
+    out = BytesIO()
+    card.save(out, format="PNG")
+    out.seek(0)
+    return out
+
+
+# === Хендлеры ===
+
+WELCOME = (
+    "Привет! Я — генератор цветов от ДИЗ БАЛАНС 🎨 "
+    "Отправь мне фото, а я тебе отправлю его цветовую палитру в ответ."
+)
 
 @dp.message(CommandStart())
 async def on_start(message: Message):
-    # если пришли из поста/кнопки — сразу проверим подписку
-    if message.chat.type == ChatType.PRIVATE:
-        if await is_subscriber(bot, message.from_user.id):
-            await message.answer(WELCOME_TEXT)
-        else:
-            await message.answer(
-                "Этот инструмент доступен только подписчикам канала.\n\n"
-                "Подпишитесь и нажмите <b>«Проверить подписку»</b>.",
-                parse_mode="HTML",
-                reply_markup=subscribe_keyboard()
-            )
+    user_id = message.from_user.id
+    if not await is_subscriber(user_id):
+        await message.answer(
+            "Этот инструмент доступен только подписчикам канала. "
+            "Подпишись и вернись — разблокирую генератор.",
+            reply_markup=subscribe_kb()
+        )
+        return
+    await message.answer(WELCOME)
 
 @dp.callback_query(F.data == "check_sub")
-async def on_check_sub(callback):
-    uid = callback.from_user.id
-    if await is_subscriber(bot, uid):
-        await callback.message.edit_text(WELCOME_TEXT)
+async def on_check_sub(call):
+    uid = call.from_user.id
+    if await is_subscriber(uid):
+        await call.message.edit_text("Готово! Подписка найдена. Можешь присылать фото 🎯")
     else:
-        await callback.answer("Пока не вижу подписку. Подпишись и нажми ещё раз.", show_alert=True)
+        await call.answer("Пока не вижу подписки 🙏", show_alert=True)
 
 @dp.message(F.photo)
-async def on_photo(message: Message):
-    # ограничиваем только приватные чаты (боту кидают фото)
-    if message.chat.type != ChatType.PRIVATE:
-        return
+async def on_photo_private(message: Message):
+    # если это приват-чат — проверяем подписку
+    if message.chat.type == "private":
+        if not await is_subscriber(message.from_user.id):
+            await message.answer(
+                "Инструмент доступен только подписчикам. "
+                "Подпишись на канал и нажми «Проверить подписку».",
+                reply_markup=subscribe_kb()
+            )
+            return
 
-    if not await is_subscriber(bot, message.from_user.id):
-        await message.answer(
-            "Инструмент только для подписчиков канала.\nПодпишитесь и нажмите «Проверить подписку».",
-            reply_markup=subscribe_keyboard()
-        )
-        return
-
+    # грузим файл
     try:
         file = await bot.get_file(message.photo[-1].file_id)
-        file_bytes = await bot.download_file(file.file_path)
-        im = Image.open(io.BytesIO(file_bytes.read())).convert("RGB")
+        photo_bytes = await bot.download_file(file.file_path)
+        photo_data = photo_bytes.read()
 
-        # выборка пикселей в LAB + «умная» 12‑ка
-        pixels_lab = _prepare_pixels(im)
-        colors = _kmeans_colors(pixels_lab, PALETTE_K)
+        out = await generate_palette_image(photo_data, k=12)
+        await message.reply_photo(BufferedInputFile(out.getvalue(), filename="palette.png"),
+                                  caption="Готово! Палитра: 12 цветов (HEX на карточках)")
+    except Exception:
+        await message.reply("Не удалось обработать изображение. Попробуйте другое фото.")
 
-        # карточка + список HEX
-        preview_for_card = im.copy()
-        preview_for_card.thumbnail((480, 480), Image.LANCZOS)
-        card_img, hexes = render_palette_card(colors, source_preview=preview_for_card)
+# Сообщения в КАНАЛЕ: отвечаем палитрой в треде поста
+@dp.channel_post(F.photo)
+async def on_channel_photo(message: Message):
+    try:
+        # убеждаемся, что это именно наш канал
+        if message.chat.id != await get_channel_id():
+            return
+        file = await bot.get_file(message.photo[-1].file_id)
+        b = await bot.download_file(file.file_path)
+        out = await generate_palette_image(b.read(), k=12)
+        await message.reply_photo(BufferedInputFile(out.getvalue(), filename="palette.png"),
+                                  caption="Палитра: 12 цветов")
+    except Exception:
+        await message.reply("Не удалось обработать изображение. Попробуйте другое фото.")
 
-        buf = io.BytesIO()
-        card_img.save(buf, format="PNG")
-        buf.seek(0)
+async def main():
+    # Разрешим нужные апдейты, чтобы снизить шум
+    await dp.start_polling(bot, allowed_updates=["message", "channel_post", "callback_query"])
 
-        caption = "Палитра: " + " ".join(hexes)
-        await message.answer_photo(
-            BufferedInputFile(buf.read(), filename="palette.png"),
-            caption=caption,
-            parse_mode="HTML"
-        )
-
-    except Exception as e:
-        await message.answer("Не удалось обработать изображение. Попробуйте другое фото.")
-        # можно логнуть, если нужно:
-        # print("Error:", e)
-
-# ================== Запуск ==================
 if __name__ == "__main__":
-    import asyncio
-    print("color-bot | Бот запускаем. Канал:", f"@{CHANNEL_USERNAME}")
-    asyncio.run(dp.start_polling(bot))
+    asyncio.run(main())
